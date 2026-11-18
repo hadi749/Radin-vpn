@@ -86,5 +86,27 @@ class DnsResponseCacheTest {
         assertNull(cache.get(qB, routeBucket = 1))
         assertNotNull(cache.get(qC, routeBucket = 1))
     }
+
+    @Test
+    fun testStaleWhileRevalidateReturnsStaleWithinGraceAndEvictsAfterGrace() {
+        val nowMs = AtomicLong(10_000L)
+        val cache = DnsResponseCache(maxEntries = 8, minTtlSec = 15, maxTtlSec = 60, clockMs = { nowMs.get() })
+        val q = TunnelPackets.buildDnsARecordQuery("telegram.com", 0x1234)
+        cache.put(q, fakeResponse(0x12, 0x34, "telegram", ttlSec = 20), routeBucket = 2)
+
+        val fresh = cache.getWithStale(q, routeBucket = 2, maxStaleGraceMs = 30_000L)
+        assertNotNull(fresh)
+        org.junit.Assert.assertFalse(fresh!!.isStale)
+
+        // Advance past 20s TTL but within 30s grace period
+        nowMs.addAndGet(25_000L)
+        val stale = cache.getWithStale(q, routeBucket = 2, maxStaleGraceMs = 30_000L)
+        assertNotNull(stale)
+        org.junit.Assert.assertTrue(stale!!.isStale)
+
+        // Advance past TTL + grace (20s + 30s = 50s) -> evicted
+        nowMs.addAndGet(30_000L)
+        assertNull(cache.getWithStale(q, routeBucket = 2, maxStaleGraceMs = 30_000L))
+    }
 }
 

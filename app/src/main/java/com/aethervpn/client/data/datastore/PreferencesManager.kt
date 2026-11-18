@@ -36,18 +36,19 @@ enum class SplitTunnelMode(val id: Int) {
 }
 
 enum class VpnProtocol(val id: Int, val displayName: String) {
+    AUTO_SMART(3, "Auto Smart (اتصال هوشمند)"),
+    SOFTETHER_NATIVE(2, "SoftEther Native (Multi-TCP)"),
     SSTP(0, "SoftEther SSTP"),
-    WARP(1, "Cloudflare WARP"),
-    SOFTETHER_NATIVE(2, "SoftEther Native (Multi-TCP)");
+    WARP(1, "Cloudflare WARP");
 
     companion object {
-        fun fromId(id: Int): VpnProtocol = entries.firstOrNull { it.id == id } ?: SSTP
+        fun fromId(id: Int): VpnProtocol = entries.firstOrNull { it.id == id } ?: AUTO_SMART
     }
 }
 
 data class UserSettings(
-    val vpnProtocol: VpnProtocol = VpnProtocol.SSTP,
-    val softEtherConnections: Int = 2,
+    val vpnProtocol: VpnProtocol = VpnProtocol.AUTO_SMART,
+    val softEtherConnections: Int = 4,
     val warpAccountJson: String = "",
     val warpCleanEndpoint: String = "",
     val warpPort: Int = 2408,
@@ -72,7 +73,8 @@ data class UserSettings(
     val bypassIran: Boolean = true,
     val blockIpv6: Boolean = true,
     val customBypassRules: String = "",
-    val vpnBypassProfiles: Map<String, String> = emptyMap()
+    val vpnBypassProfiles: Map<String, String> = emptyMap(),
+    val vpnProtocolProfiles: Map<String, String> = emptyMap()
 )
 
 class PreferencesManager(private val context: Context) {
@@ -104,13 +106,14 @@ class PreferencesManager(private val context: Context) {
         val BLOCK_IPV6 = booleanPreferencesKey("block_ipv6")
         val CUSTOM_BYPASS_RULES = stringPreferencesKey("custom_bypass_rules")
         val VPN_BYPASS_PROFILES = stringPreferencesKey("vpn_bypass_profiles")
+        val VPN_PROTOCOL_PROFILES = stringPreferencesKey("vpn_protocol_profiles")
         val SOFTETHER_CONNECTIONS = intPreferencesKey("softether_connections")
     }
 
     val settingsFlow: Flow<UserSettings> = context.dataStore.data.map { pref ->
         UserSettings(
-            vpnProtocol = VpnProtocol.fromId(pref[Keys.VPN_PROTOCOL] ?: 0),
-            softEtherConnections = (pref[Keys.SOFTETHER_CONNECTIONS] ?: 2).let { if (it == 8) 2 else it }.coerceIn(1, 16),
+            vpnProtocol = pref[Keys.VPN_PROTOCOL]?.let { VpnProtocol.fromId(it) } ?: VpnProtocol.AUTO_SMART,
+            softEtherConnections = (pref[Keys.SOFTETHER_CONNECTIONS] ?: 4).let { if (it == 8) 4 else it }.coerceIn(1, 16),
             warpAccountJson = pref[Keys.WARP_ACCOUNT_JSON] ?: "",
             warpCleanEndpoint = pref[Keys.WARP_CLEAN_ENDPOINT] ?: "",
             warpPort = pref[Keys.WARP_PORT] ?: 2408,
@@ -137,7 +140,8 @@ class PreferencesManager(private val context: Context) {
             bypassIran = pref[Keys.BYPASS_IRAN] ?: true,
             blockIpv6 = pref[Keys.BLOCK_IPV6] ?: true,
             customBypassRules = pref[Keys.CUSTOM_BYPASS_RULES] ?: "",
-            vpnBypassProfiles = parseBypassProfiles(pref[Keys.VPN_BYPASS_PROFILES].orEmpty())
+            vpnBypassProfiles = parseBypassProfiles(pref[Keys.VPN_BYPASS_PROFILES].orEmpty()),
+            vpnProtocolProfiles = parseBypassProfiles(pref[Keys.VPN_PROTOCOL_PROFILES].orEmpty())
         )
     }
 
@@ -246,6 +250,18 @@ class PreferencesManager(private val context: Context) {
         context.dataStore.edit { it[Keys.VPN_PROTOCOL] = protocol.id }
     }
 
+    suspend fun updateVpnProtocolProfile(networkKey: String, protocolName: String) {
+        context.dataStore.edit { pref ->
+            val cleanKey = networkKey.trim().uppercase()
+            val cleanProto = protocolName.trim()
+            if (cleanKey.isNotEmpty() && cleanProto.isNotEmpty()) {
+                val updated = parseBypassProfiles(pref[Keys.VPN_PROTOCOL_PROFILES].orEmpty()).toMutableMap()
+                updated[cleanKey] = cleanProto
+                pref[Keys.VPN_PROTOCOL_PROFILES] = encodeBypassProfiles(updated)
+            }
+        }
+    }
+
     suspend fun updateSoftEtherConnections(count: Int) {
         context.dataStore.edit { it[Keys.SOFTETHER_CONNECTIONS] = count.coerceIn(1, 16) }
     }
@@ -267,6 +283,7 @@ class PreferencesManager(private val context: Context) {
             pref.remove(Keys.LAST_VPN_BYPASS)
             pref.remove(Keys.LAST_MIRROR_BYPASS)
             pref.remove(Keys.VPN_BYPASS_PROFILES)
+            pref.remove(Keys.VPN_PROTOCOL_PROFILES)
         }
     }
 

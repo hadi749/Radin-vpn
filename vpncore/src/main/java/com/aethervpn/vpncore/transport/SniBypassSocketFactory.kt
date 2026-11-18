@@ -23,7 +23,8 @@ class SniBypassSocketFactory(
     private val strictCert: Boolean = false,
     private val socketProtector: SocketProtector? = null,
     private val onCertificateCaptured: ((X509Certificate) -> Unit)? = null,
-    private val onSocketCreated: ((Socket) -> Unit)? = null
+    private val onSocketCreated: ((Socket) -> Unit)? = null,
+    private val decoySeed: Int = 0
 ) {
 
     private val trustManager = object : X509TrustManager {
@@ -67,16 +68,17 @@ class SniBypassSocketFactory(
         }
         return when (eff) {
             SniStrategy.DECOY_SNI_FRAGMENT ->
-                SniStrategy.DEFAULT_DECOY_SNIS.first()
+                SniStrategy.pickDecoySni(decoySeed)
             SniStrategy.CUSTOM_SNI ->
-                if (isRawIp(host)) SniStrategy.DEFAULT_DECOY_SNIS.first() else host
+                if (isRawIp(host)) SniStrategy.pickDecoySni(decoySeed) else host
             SniStrategy.TCP_FRAGMENTATION,
             SniStrategy.TLS_RECORD_FRAGMENTATION,
             SniStrategy.MULTI_CHUNK_FRAGMENTATION,
             SniStrategy.TLS_HEADER_DESYNC,
             SniStrategy.WINDOW_ALPN_MICRO_DESYNC,
-            SniStrategy.ZAPRET_SPLIT1_DESYNC ->
-                if (isRawIp(host)) SniStrategy.DEFAULT_DECOY_SNIS.first() else host
+            SniStrategy.ZAPRET_SPLIT1_DESYNC,
+            SniStrategy.ADAPTIVE_HYBRID_DESYNC ->
+                if (isRawIp(host)) SniStrategy.pickDecoySni(decoySeed) else host
             else ->
                 if (isRawIp(host)) null else host
         }
@@ -88,7 +90,9 @@ class SniBypassSocketFactory(
         timeoutMs: Int
     ): Socket {
         val eff = effectiveStrategy()
-        val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC || eff == SniStrategy.ZAPRET_SPLIT1_DESYNC
+        val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC ||
+            eff == SniStrategy.ZAPRET_SPLIT1_DESYNC ||
+            eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC
         val rawSocket = openProtectedTcpSocket(
             ipAddress = ipAddress,
             port = port,
@@ -151,6 +155,16 @@ class SniBypassSocketFactory(
                 zapretSplit1 = true,
                 headerStallMs = 28L
             )
+            SniStrategy.ADAPTIVE_HYBRID_DESYNC -> ClientHelloTransformSocket(
+                delegate = rawSocket,
+                tcpChunkSize = 24,
+                tcpDelayMs = (2L + ((decoySeed and 0x7FFFFFFF) % 3L)),
+                splitTlsRecords = false,
+                useSniAwareTcpSlices = false,
+                adaptiveHybrid = true,
+                adaptiveSeed = decoySeed,
+                headerStallMs = (18L + ((decoySeed and 0x7FFFFFFF) % 10L))
+            )
             else -> rawSocket
         }
     }
@@ -176,7 +190,13 @@ class SniBypassSocketFactory(
             if (preferredProtos.isNotEmpty()) {
                 params.protocols = preferredProtos.toTypedArray()
             }
-            val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC || eff == SniStrategy.ZAPRET_SPLIT1_DESYNC
+            val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC ||
+                eff == SniStrategy.ZAPRET_SPLIT1_DESYNC ||
+                eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC
+            val isBrowserMimic = isWindowMicro ||
+                eff == SniStrategy.TLS_HEADER_DESYNC ||
+                eff == SniStrategy.DECOY_SNI_FRAGMENT ||
+                eff == SniStrategy.MULTI_CHUNK_FRAGMENTATION
             val prioritizedCiphers = prioritizeBrowserCipherSuites(
                 supportedCipherSuites,
                 limitTail = if (isWindowMicro) 6 else Int.MAX_VALUE
@@ -184,13 +204,18 @@ class SniBypassSocketFactory(
             if (prioritizedCiphers.isNotEmpty()) {
                 params.cipherSuites = prioritizedCiphers
             }
-            if (isWindowMicro) {
+            if (isBrowserMimic) {
                 params.useCipherSuitesOrder = true
                 // Guard ALPN reflection-style so both JVM 17+ and Android API 24..28 run cleanly without NewApi issues.
                 runCatching {
+                    val alpn = if (eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC || eff == SniStrategy.DECOY_SNI_FRAGMENT) {
+                        arrayOf("h2", "http/1.1")
+                    } else {
+                        arrayOf("http/1.1")
+                    }
                     params.javaClass
                         .getMethod("setApplicationProtocols", Array<String>::class.java)
-                        .invoke(params, arrayOf("http/1.1"))
+                        .invoke(params, alpn)
                 }
             }
         }
@@ -308,6 +333,8 @@ class SniBypassSocketFactory(
         private val headerDesync: Boolean = false,
         private val microDesync: Boolean = false,
         private val zapretSplit1: Boolean = false,
+        private val adaptiveHybrid: Boolean = false,
+        private val adaptiveSeed: Int = 0,
         private val headerStallMs: Long = 0L
     ) : Socket() {
         private var transformed = false
@@ -365,6 +392,16 @@ class SniBypassSocketFactory(
         }
 
         private fun writeSegmented(out: OutputStream, bytes: ByteArray) {
+            if (adaptiveHybrid && bytes.size > 5) {
+                val slices = TlsClientHelloInspector.computeAdaptiveHybridSlices(
+                    packet = bytes,
+                    offset = 0,
+                    length = bytes.size,
+                    cutSeed = adaptiveSeed
+                )
+                writeSlices(out, bytes, slices)
+                return
+            }
             if (zapretSplit1 && bytes.size > 5) {
                 val slices = TlsClientHelloInspector.computeSplit1Slices(bytes)
                 writeSlices(out, bytes, slices)

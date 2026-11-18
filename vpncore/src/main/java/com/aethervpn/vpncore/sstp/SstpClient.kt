@@ -32,7 +32,9 @@ import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.security.cert.X509Certificate
 import java.util.UUID
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 data class SstpConfig(
@@ -115,6 +117,18 @@ class SstpClient(
     private val rxHeaderBuf = ByteArray(4)
     private val rxFastPacketBuf = ByteArray(65536)
 
+    // Pre-allocated TX coalescing ring buffer for batching burst packets into fewer TLS records
+    private val txRingCapacity = 64
+    private val txRingLock = Any()
+    private val txRingPackets = Array(txRingCapacity) { ByteArray(4096) }
+    private val txRingLengths = IntArray(txRingCapacity)
+    private var txRingHead = 0
+    private var txRingTail = 0
+    private val txRingCount = AtomicInteger(0)
+    private val txSignal = Semaphore(0)
+    private val txBatchBuf = ByteArray(49152)
+    private var txWriterJob: Job? = null
+
     private val txBytes = AtomicLong(0)
     private val rxBytes = AtomicLong(0)
     private val txPackets = AtomicLong(0)
@@ -126,11 +140,27 @@ class SstpClient(
     private val lastUnicastIpRxMs = AtomicLong(0)
     @Volatile
     private var probeInterceptor: ((ByteArray) -> Boolean)? = null
+    @Volatile
+    private var packetProbeInterceptor: ((ByteArray, Int, Int) -> Boolean)? = null
 
     private var echoJob: Job? = null
 
     override fun setProbeInterceptor(interceptor: ((ByteArray) -> Boolean)?) {
         probeInterceptor = interceptor
+        if (interceptor == null) {
+            packetProbeInterceptor = null
+        } else {
+            packetProbeInterceptor = { buf, off, len ->
+                interceptor.invoke(buf.copyOfRange(off, off + len))
+            }
+        }
+    }
+
+    override fun setPacketProbeInterceptor(interceptor: ((ByteArray, Int, Int) -> Boolean)?) {
+        packetProbeInterceptor = interceptor
+        if (interceptor == null) {
+            probeInterceptor = null
+        }
     }
 
     override fun snapshotTraffic(): SstpTrafficSnapshot = SstpTrafficSnapshot(
@@ -159,7 +189,8 @@ class SstpClient(
                 socketProtector = socketProtector,
                 onCertificateCaptured = { cert ->
                     serverCert = cert
-                }
+                },
+                decoySeed = (System.nanoTime() and 0x7FFF).toInt()
             )
 
             listener.onStateChanged(SstpState.TLS_HANDSHAKE, "Performing TLS handshake...")
@@ -217,7 +248,10 @@ class SstpClient(
                 sstpTransport.setSoTimeout(maxOf(config.keepaliveIntervalSec * 3000, 30_000))
             } catch (_: Exception) {}
 
-            // Start Echo Keepalive job
+            // Start TX coalescing writer + Echo Keepalive job
+            txWriterJob = scope.launch(Dispatchers.IO) {
+                txBatchWriterLoop(nativeOs)
+            }
             echoJob = scope.launch {
                 keepaliveLoop(nativeOs)
             }
@@ -780,14 +814,11 @@ class SstpClient(
                     ) {
                         val ipOffset = 8
                         val ipLen = len - 8
-                        val interceptor = probeInterceptor
-                        if (interceptor != null) {
-                            val probeCopy = rxFastPacketBuf.copyOfRange(ipOffset, len)
-                            if (interceptor.invoke(probeCopy)) {
-                                rxUnicastPackets.incrementAndGet()
-                                lastUnicastIpRxMs.set(System.currentTimeMillis())
-                                continue
-                            }
+                        val pktProbe = packetProbeInterceptor
+                        if (pktProbe != null && pktProbe.invoke(rxFastPacketBuf, ipOffset, ipLen)) {
+                            rxUnicastPackets.incrementAndGet()
+                            lastUnicastIpRxMs.set(System.currentTimeMillis())
+                            continue
                         }
                         if (TunnelPackets.isBroadcastOrMulticastIpv4(rxFastPacketBuf, ipOffset, ipLen)) {
                             rxBroadcastDropped.incrementAndGet()
@@ -810,6 +841,12 @@ class SstpClient(
                     ) {
                         val ipOffset = 7
                         val ipLen = len - 7
+                        val pktProbe = packetProbeInterceptor
+                        if (pktProbe != null && pktProbe.invoke(rxFastPacketBuf, ipOffset, ipLen)) {
+                            rxUnicastPackets.incrementAndGet()
+                            lastUnicastIpRxMs.set(System.currentTimeMillis())
+                            continue
+                        }
                         if (!TunnelPackets.isBroadcastOrMulticastIpv4(rxFastPacketBuf, ipOffset, ipLen)) {
                             rxPackets.incrementAndGet()
                             rxUnicastPackets.incrementAndGet()
@@ -864,8 +901,8 @@ class SstpClient(
             val ppp = PppFrame.decode(pkt.payload)
             when (ppp.protocol) {
                 PppFrame.PROTO_IP -> {
-                    val interceptor = probeInterceptor
-                    if (interceptor != null && interceptor.invoke(ppp.payload)) {
+                    val pktProbe = packetProbeInterceptor
+                    if (pktProbe != null && pktProbe.invoke(ppp.payload, 0, ppp.payload.size)) {
                         rxUnicastPackets.incrementAndGet()
                         lastUnicastIpRxMs.set(System.currentTimeMillis())
                         return true
@@ -929,21 +966,50 @@ class SstpClient(
 
     /**
      * Sends an IPv4 packet through the tunnel (encapsulated into PPP -> SSTP data packet).
-     * Uses zero-heap-allocation direct framing over the buffered output stream in a single write.
+     * Enqueues into a pre-allocated ring buffer for batched TLS writes, with direct fallback under saturation.
      */
     override fun sendIpPacket(packet: ByteArray, length: Int) {
         if (!isRunning.get() || length <= 0 || length > 4087) return
-        val os = outputStream ?: return
         val totalLen = 8 + length
+        val enqueued = synchronized(txRingLock) {
+            if (txRingCount.get() >= txRingCapacity) {
+                false
+            } else {
+                val idx = txRingTail
+                val buf = txRingPackets[idx]
+                buf[0] = SstpPacket.VERSION_1_0
+                buf[1] = SstpPacket.FLAG_DATA
+                buf[2] = ((totalLen ushr 8) and 0x0F).toByte()
+                buf[3] = (totalLen and 0xFF).toByte()
+                buf[4] = 0xFF.toByte()
+                buf[5] = 0x03.toByte()
+                buf[6] = 0x00
+                buf[7] = 0x21
+                System.arraycopy(packet, 0, buf, 8, length)
+                txRingLengths[idx] = totalLen
+                txRingTail = (idx + 1) % txRingCapacity
+                txRingCount.incrementAndGet()
+                true
+            }
+        }
+        if (enqueued) {
+            txSignal.release()
+            lastAnyTxMs.set(System.currentTimeMillis())
+            txPackets.incrementAndGet()
+            txBytes.addAndGet(length.toLong())
+            listener.onBytesTransferred(length.toLong(), 0)
+            return
+        }
+
+        // Fallback direct write when burst ring is saturated (natural TCP backpressure)
+        val os = outputStream ?: return
         synchronized(os) {
             txFastBuf[0] = SstpPacket.VERSION_1_0
             txFastBuf[1] = SstpPacket.FLAG_DATA
             txFastBuf[2] = ((totalLen ushr 8) and 0x0F).toByte()
             txFastBuf[3] = (totalLen and 0xFF).toByte()
-            // HDLC Address (0xFF) + Control (0x03)
             txFastBuf[4] = 0xFF.toByte()
             txFastBuf[5] = 0x03.toByte()
-            // PPP Protocol: 0x0021 (IPv4)
             txFastBuf[6] = 0x00
             txFastBuf[7] = 0x21
             System.arraycopy(packet, 0, txFastBuf, 8, length)
@@ -954,6 +1020,45 @@ class SstpClient(
         txPackets.incrementAndGet()
         txBytes.addAndGet(length.toLong())
         listener.onBytesTransferred(length.toLong(), 0)
+    }
+
+    private fun txBatchWriterLoop(os: OutputStream) {
+        try {
+            while (isRunning.get()) {
+                txSignal.acquire()
+                txSignal.drainPermits()
+                if (!isRunning.get()) break
+
+                while (isRunning.get()) {
+                    var offset = 0
+                    var count = 0
+                    synchronized(txRingLock) {
+                        while (count < 12 && txRingCount.get() > 0) {
+                            val idx = txRingHead
+                            val pktLen = txRingLengths[idx]
+                            if (offset + pktLen > txBatchBuf.size) break
+                            System.arraycopy(txRingPackets[idx], 0, txBatchBuf, offset, pktLen)
+                            offset += pktLen
+                            count++
+                            txRingHead = (idx + 1) % txRingCapacity
+                            txRingCount.decrementAndGet()
+                        }
+                    }
+                    if (offset == 0) break
+                    synchronized(os) {
+                        os.write(txBatchBuf, 0, offset)
+                        os.flush()
+                    }
+                    lastAnyTxMs.set(System.currentTimeMillis())
+                }
+            }
+        } catch (_: InterruptedException) {
+        } catch (_: CancellationException) {
+        } catch (e: Exception) {
+            if (isRunning.get()) {
+                logDebug("txBatchWriterLoop error: ${e.message}")
+            }
+        }
     }
 
     private fun readFully(input: InputStream, buf: ByteArray, offset: Int, length: Int) {
@@ -986,6 +1091,8 @@ class SstpClient(
 
     override fun close() {
         if (isRunning.compareAndSet(true, false)) {
+            txSignal.release()
+            txWriterJob?.cancel()
             echoJob?.cancel()
             listener.onStateChanged(SstpState.DISCONNECTING, "Disconnecting...")
             try {

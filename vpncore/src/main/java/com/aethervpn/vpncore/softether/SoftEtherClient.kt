@@ -80,9 +80,13 @@ class SoftEtherClient(
     private val socketProtector: SocketProtector?,
     private val listener: SoftEtherEventListener
 ) : TunnelClient {
-    private val isRunning = AtomicBoolean(false)
+    private var isRunning = AtomicBoolean(false)
     private var clientJob: Job? = null
+    @Volatile
     private var probeInterceptor: ((ByteArray) -> Boolean)? = null
+    @Volatile
+    private var packetProbeInterceptor: ((ByteArray, Int, Int) -> Boolean)? = null
+    private val decoySeedSeq = AtomicInteger(0)
 
     private val channels = CopyOnWriteArrayList<SoftEtherChannel>()
     @Volatile
@@ -110,12 +114,61 @@ class SoftEtherClient(
     val lastAnyRxMs = AtomicLong(System.currentTimeMillis())
     val lastUnicastIpRxMs = AtomicLong(System.currentTimeMillis())
 
+    companion object {
+        /**
+         * Selects the starting channel index preserving per-flow TCP ordering when the hashed channel
+         * is healthy & uncongested, and transparently failing over to the least-congested channel otherwise.
+         */
+        internal fun selectPreferredChannelIndex(
+            channels: Array<SoftEtherChannel>,
+            flowHash: Int,
+            rrCursor: Int,
+            nowMs: Long
+        ): Int {
+            val count = channels.size
+            if (count <= 1) return 0
+            val baseIdx = if (flowHash != 0) (flowHash and 0x7FFFFFFF) % count else (rrCursor and 0x7FFFFFFF) % count
+            val preferred = channels[baseIdx]
+            if (preferred.isHealthy(nowMs) && !preferred.isCongested()) {
+                return baseIdx
+            }
+            var bestIdx = baseIdx
+            var bestScore = Long.MAX_VALUE
+            for (i in 0 until count) {
+                val idx = (baseIdx + i) % count
+                val ch = channels[idx]
+                if (!ch.isConnected.get()) continue
+                val penalty = if (ch.isHealthy(nowMs)) 0L else 10_000_000L
+                val score = penalty + (ch.queueDepth().toLong() * 25_000L) + ch.ewmaWriteUs.get()
+                if (score < bestScore) {
+                    bestScore = score
+                    bestIdx = idx
+                }
+            }
+            return bestIdx
+        }
+    }
+
     private fun updateActiveChannels() {
         activeChannelsArray = channels.filter { it.isConnected.get() }.toTypedArray()
     }
 
     override fun setProbeInterceptor(interceptor: ((ByteArray) -> Boolean)?) {
         this.probeInterceptor = interceptor
+        if (interceptor == null) {
+            this.packetProbeInterceptor = null
+        } else {
+            this.packetProbeInterceptor = { buf, off, len ->
+                interceptor.invoke(buf.copyOfRange(off, off + len))
+            }
+        }
+    }
+
+    override fun setPacketProbeInterceptor(interceptor: ((ByteArray, Int, Int) -> Boolean)?) {
+        this.packetProbeInterceptor = interceptor
+        if (interceptor == null) {
+            this.probeInterceptor = null
+        }
     }
 
     override fun snapshotTraffic(): SstpTrafficSnapshot = SstpTrafficSnapshot(
@@ -142,7 +195,8 @@ class SoftEtherClient(
                 customSni = config.customSni,
                 strictCert = config.strictCert,
                 socketProtector = socketProtector,
-                connectTimeoutMs = config.connectTimeoutMs
+                connectTimeoutMs = config.connectTimeoutMs,
+                decoySeed = decoySeedSeq.getAndIncrement()
             )
 
             listener.onStateChanged(SoftEtherState.AUTHENTICATING, "Authenticating with Virtual Hub '${config.hubName}'...")
@@ -155,6 +209,7 @@ class SoftEtherClient(
 
             sessionKey = sessionInfo.sessionKey
             channels.add(primaryChannel)
+            primaryChannel.startWriter(scope)
             updateActiveChannels()
 
             // Start reading on primary channel
@@ -187,7 +242,8 @@ class SoftEtherClient(
                                     customSni = config.customSni,
                                     strictCert = config.strictCert,
                                     socketProtector = socketProtector,
-                                    connectTimeoutMs = config.connectTimeoutMs
+                                    connectTimeoutMs = config.connectTimeoutMs,
+                                    decoySeed = decoySeedSeq.getAndIncrement()
                                 )
                                 ch.connectAndHandshake(
                                     username = config.username,
@@ -197,6 +253,7 @@ class SoftEtherClient(
                                     existingSessionKey = sessionKey
                                 )
                                 channels.add(ch)
+                                ch.startWriter(scope)
                                 updateActiveChannels()
 
                                 scope.launch(Dispatchers.IO) {
@@ -237,14 +294,17 @@ class SoftEtherClient(
             // 4. Supervision loop
             while (scope.isActive && isRunning.get()) {
                 delay(2000)
-                cleanupDeadChannels()
+                val now = System.currentTimeMillis()
+                cleanupDeadChannels(now)
                 val currentChannels = activeChannelsArray
                 if (currentChannels.isEmpty()) {
                     throw IOException("All SoftEther channels disconnected")
                 }
                 ensureChannelsCount(scope, effectiveTarget)
                 for (ch in currentChannels) {
-                    ch.sendKeepalive()
+                    if (now - ch.lastTxMs.get() >= 10_000L) {
+                        ch.sendKeepalive()
+                    }
                 }
                 if (gatewayMac.contentEquals(SoftEtherFrame.BROADCAST_MAC)) {
                     val assigned = acquiredDhcp
@@ -397,11 +457,9 @@ class SoftEtherClient(
                 lastUnicastIpRxMs.set(now)
 
                 val ipOffset = offset + SoftEtherFrame.ETHERNET_HEADER_SIZE
-                if (probeInterceptor != null) {
-                    val ipPacketCopy = frame.copyOfRange(ipOffset, ipOffset + actualLen)
-                    if (probeInterceptor?.invoke(ipPacketCopy) == true) {
-                        return
-                    }
+                val pktProbe = packetProbeInterceptor
+                if (pktProbe != null && pktProbe.invoke(frame, ipOffset, actualLen)) {
+                    return
                 }
 
                 listener.onIpPacketReceived(frame, ipOffset, actualLen)
@@ -509,7 +567,8 @@ class SoftEtherClient(
 
     /**
      * Send an IP packet received from Android TUN interface.
-     * Encapsulates it directly into an Ethernet frame in the channel txBuffer with zero heap allocations.
+     * Enqueues into a pre-allocated ring buffer for batched multi-frame writes,
+     * failing over automatically to healthy uncongested TCP channels.
      */
     override fun sendIpPacket(packet: ByteArray, length: Int) {
         if (!isRunning.get() || length <= 0) return
@@ -518,11 +577,17 @@ class SoftEtherClient(
             val count = currentChannels.size
             if (count == 0) return
 
+            val now = System.currentTimeMillis()
             val flowHash = SoftEtherFrame.computeFlowHash(packet, 0, length)
-            val startIdx = if (flowHash != 0) (flowHash and 0x7FFFFFFF) % count else (txChannelIndex.getAndIncrement() and 0x7FFFFFFF) % count
+            val startIdx = selectPreferredChannelIndex(
+                channels = currentChannels,
+                flowHash = flowHash,
+                rrCursor = if (flowHash == 0) txChannelIndex.getAndIncrement() else 0,
+                nowMs = now
+            )
             for (i in 0 until count) {
                 val ch = currentChannels[(startIdx + i) % count]
-                if (ch.sendIpPacketAsFrame(clientMac, gatewayMac, packet, 0, length)) {
+                if (ch.enqueueIpPacket(clientMac, gatewayMac, packet, 0, length)) {
                     txPackets.incrementAndGet()
                     totalTxBytes.addAndGet(length.toLong())
                     listener.onBytesTransferred(length.toLong(), 0)
@@ -543,10 +608,16 @@ class SoftEtherClient(
         }
     }
 
-    private fun cleanupDeadChannels() {
-        val dead = channels.filter { !it.isConnected.get() }
-        if (dead.isNotEmpty()) {
-            for (ch in dead) {
+    private fun cleanupDeadChannels(nowMs: Long = System.currentTimeMillis()) {
+        val staleOrDead = channels.filter { ch ->
+            !ch.isConnected.get() ||
+                (!ch.isPrimary && ch.txBytes.get() > 8192L && (nowMs - ch.lastRxMs.get()) > 25_000L && channels.size > 1)
+        }
+        if (staleOrDead.isNotEmpty()) {
+            for (ch in staleOrDead) {
+                if (ch.isConnected.get()) {
+                    listener.onLog("Recycling stalled secondary TCP channel ${ch.channelId}")
+                }
                 ch.close()
                 channels.remove(ch)
             }
@@ -562,7 +633,7 @@ class SoftEtherClient(
             for (i in 0 until minOf(needed, 2)) {
                 scope.launch(Dispatchers.IO) {
                     try {
-                        val nextId = channels.size + 1
+                        val nextId = decoySeedSeq.getAndIncrement() + 1
                         val ch = SoftEtherChannel(
                             channelId = nextId,
                             host = config.host,
@@ -573,7 +644,8 @@ class SoftEtherClient(
                             customSni = config.customSni,
                             strictCert = config.strictCert,
                             socketProtector = socketProtector,
-                            connectTimeoutMs = config.connectTimeoutMs
+                            connectTimeoutMs = config.connectTimeoutMs,
+                            decoySeed = nextId
                         )
                         ch.connectAndHandshake(
                             username = config.username,
@@ -583,6 +655,7 @@ class SoftEtherClient(
                             existingSessionKey = key
                         )
                         channels.add(ch)
+                        ch.startWriter(scope)
                         updateActiveChannels()
                         listener.onLog("Channel $nextId reconnected (fast-reconnect within 2s cycle)")
                         ch.readLoop { buffer, offset, length -> handleIncomingEthernetFrame(buffer, offset, length) }

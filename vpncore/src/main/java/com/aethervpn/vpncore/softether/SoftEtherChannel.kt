@@ -11,16 +11,22 @@ import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
  * An individual TCP/TLS channel to a SoftEther VPN Server.
- * Supports primary session negotiation (login) and secondary channel joining (additional_connect).
+ * Supports primary session negotiation (login), secondary channel joining (additional_connect),
+ * and zero-allocation multi-frame TX batching for high throughput over high-RTT cellular/Wi-Fi links.
  */
 class SoftEtherChannel(
     val channelId: Int,
@@ -32,8 +38,48 @@ class SoftEtherChannel(
     val customSni: String?,
     val strictCert: Boolean,
     val socketProtector: SocketProtector?,
-    val connectTimeoutMs: Int = 10000
+    val connectTimeoutMs: Int = 10000,
+    val decoySeed: Int = channelId
 ) {
+    companion object {
+        private const val TX_RING_CAPACITY = 64
+        private const val TX_SLOT_SIZE = 2048
+        private const val MAX_BATCH_FRAMES = 16
+        private const val MAX_BATCH_BYTES = 49152
+        private const val HIGH_WATER_QUEUE = 48
+
+        private val BROWSER_USER_AGENTS = arrayOf(
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0"
+        )
+
+        /**
+         * Encodes a batch of raw Ethernet frames into a SoftEther multi-frame binary block:
+         * [int32 numFrames][int32 len0][frame0]...[int32 lenN-1][frameN-1]
+         * Exposed internally for unit testing and reuse.
+         */
+        internal fun encodeMultiFrameBlock(
+            txBuffer: ByteBuffer,
+            frames: Array<ByteArray>,
+            lengths: IntArray,
+            indices: IntArray,
+            count: Int
+        ): Int {
+            txBuffer.clear()
+            txBuffer.putInt(count)
+            for (i in 0 until count) {
+                val idx = indices[i]
+                val len = lengths[idx]
+                txBuffer.putInt(len)
+                txBuffer.put(frames[idx], 0, len)
+            }
+            txBuffer.flip()
+            return txBuffer.limit()
+        }
+    }
+
     private var transport: SstpTransport? = null
     private var input: InputStream? = null
     private var output: OutputStream? = null
@@ -41,10 +87,40 @@ class SoftEtherChannel(
     val isConnected = AtomicBoolean(false)
     val txBytes = AtomicLong(0)
     val rxBytes = AtomicLong(0)
+    val lastRxMs = AtomicLong(System.currentTimeMillis())
+    val lastTxMs = AtomicLong(System.currentTimeMillis())
+    val ewmaWriteUs = AtomicLong(400L)
+    @Volatile
+    var connectedAtMs: Long = System.currentTimeMillis()
+        private set
 
     private val writeLock = Any()
     private val txBuffer = ByteBuffer.allocate(65536).apply { order(ByteOrder.BIG_ENDIAN) }
     private val rxFrameBuf = ByteArray(65536)
+
+    // Lock-guarded pre-allocated TX ring buffer for zero-delay batching
+    private val ringLock = Any()
+    private val ringFrames = Array(TX_RING_CAPACITY) { ByteArray(TX_SLOT_SIZE) }
+    private val ringLengths = IntArray(TX_RING_CAPACITY)
+    private var ringHead = 0
+    private var ringTail = 0
+    private val ringCount = AtomicInteger(0)
+    private val txSignal = Semaphore(0)
+    private val writerStarted = AtomicBoolean(false)
+    private var writerJob: Job? = null
+    private val batchIndices = IntArray(MAX_BATCH_FRAMES)
+
+    fun queueDepth(): Int = ringCount.get()
+
+    fun isCongested(): Boolean = ringCount.get() >= HIGH_WATER_QUEUE || ewmaWriteUs.get() > 80_000L
+
+    fun isHealthy(nowMs: Long = System.currentTimeMillis()): Boolean {
+        if (!isConnected.get()) return false
+        if (rxBytes.get() > 0L) {
+            return (nowMs - lastRxMs.get()) < 30_000L
+        }
+        return (nowMs - connectedAtMs) < 18_000L
+    }
 
     suspend fun connectAndHandshake(
         username: String,
@@ -57,7 +133,8 @@ class SoftEtherChannel(
             strategy = sniStrategy,
             customSni = customSni,
             strictCert = strictCert,
-            socketProtector = socketProtector
+            socketProtector = socketProtector,
+            decoySeed = decoySeed
         )
 
         val inetAddr = try {
@@ -80,7 +157,7 @@ class SoftEtherChannel(
         val outStream = output ?: throw IllegalStateException("Output stream unavailable")
 
         // 1. Send VPNCONNECT Handshake Signature
-        val targetHost = ipAddress.ifBlank { host }
+        val targetHost = customSni?.takeIf { it.isNotBlank() } ?: ipAddress.ifBlank { host }
         val watermarkHttp = buildHttpPost(
             target = SoftEtherConstants.HTTP_CONNECT_TARGET,
             host = targetHost,
@@ -148,6 +225,10 @@ class SoftEtherChannel(
 
             try { t.setSoTimeout(0) } catch (_: Exception) {}
             try { t.setTcpNoDelay(true) } catch (_: Exception) {}
+            val now = System.currentTimeMillis()
+            connectedAtMs = now
+            lastRxMs.set(now)
+            lastTxMs.set(now)
             isConnected.set(true)
             SoftEtherSessionInfo(sessionKey = sessionKey, maxConnections = serverMaxConn)
         } else {
@@ -173,8 +254,116 @@ class SoftEtherChannel(
 
             try { t.setSoTimeout(0) } catch (_: Exception) {}
             try { t.setTcpNoDelay(true) } catch (_: Exception) {}
+            val now = System.currentTimeMillis()
+            connectedAtMs = now
+            lastRxMs.set(now)
+            lastTxMs.set(now)
             isConnected.set(true)
             SoftEtherSessionInfo(sessionKey = sessionKey, maxConnections = targetConnections)
+        }
+    }
+
+    /**
+     * Starts the dedicated non-blocking batch writer loop for this channel.
+     * Drains queued frames from the pre-allocated ring buffer and writes up to 16 frames per flush.
+     */
+    fun startWriter(scope: CoroutineScope) {
+        if (!writerStarted.compareAndSet(false, true)) return
+        writerJob = scope.launch(Dispatchers.IO) {
+            try {
+                while (isActive && isConnected.get()) {
+                    txSignal.acquire()
+                    // Coalesce additional permits if burst arrived simultaneously
+                    txSignal.drainPermits()
+                    if (!isConnected.get()) break
+                    drainAndFlushRing()
+                }
+            } catch (_: InterruptedException) {
+            } catch (_: CancellationException) {
+            } catch (e: Exception) {
+                android.util.Log.e("SoftEtherChannel", "Channel $channelId writer failed: ${e.message}", e)
+                close()
+            }
+        }
+    }
+
+    /**
+     * Enqueues an IPv4 packet as an Ethernet frame into this channel's pre-allocated TX ring buffer.
+     * Returns false immediately (non-blocking) if the ring is full or channel is disconnected,
+     * allowing the caller to immediately spill over to another healthy TCP channel.
+     */
+    fun enqueueIpPacket(
+        srcMac: ByteArray,
+        dstMac: ByteArray,
+        ipPacket: ByteArray,
+        offset: Int,
+        length: Int
+    ): Boolean {
+        if (!isConnected.get() || length <= 0 || 14 + length > TX_SLOT_SIZE) return false
+        if (!writerStarted.get()) {
+            return sendIpPacketAsFrame(srcMac, dstMac, ipPacket, offset, length)
+        }
+        val enqueued = synchronized(ringLock) {
+            if (ringCount.get() >= TX_RING_CAPACITY) {
+                false
+            } else {
+                val slotIdx = ringTail
+                val buf = ringFrames[slotIdx]
+                System.arraycopy(dstMac, 0, buf, 0, 6)
+                System.arraycopy(srcMac, 0, buf, 6, 6)
+                buf[12] = 0x08.toByte()
+                buf[13] = 0x00.toByte()
+                System.arraycopy(ipPacket, offset, buf, 14, length)
+                ringLengths[slotIdx] = 14 + length
+                ringTail = (slotIdx + 1) % TX_RING_CAPACITY
+                ringCount.incrementAndGet()
+                true
+            }
+        }
+        if (enqueued) {
+            txSignal.release()
+        }
+        return enqueued
+    }
+
+    private fun drainAndFlushRing() {
+        val out = output ?: return
+        while (isConnected.get()) {
+            var count = 0
+            var totalBatchBytes = 0
+            synchronized(ringLock) {
+                while (count < MAX_BATCH_FRAMES && ringCount.get() > 0) {
+                    val idx = ringHead
+                    val frameLen = ringLengths[idx]
+                    if (count > 0 && totalBatchBytes + 4 + frameLen > MAX_BATCH_BYTES) {
+                        break
+                    }
+                    batchIndices[count++] = idx
+                    totalBatchBytes += 4 + frameLen
+                    ringHead = (idx + 1) % TX_RING_CAPACITY
+                    ringCount.decrementAndGet()
+                }
+            }
+            if (count == 0) return
+
+            synchronized(writeLock) {
+                val startNs = System.nanoTime()
+                try {
+                    val limit = encodeMultiFrameBlock(txBuffer, ringFrames, ringLengths, batchIndices, count)
+                    out.write(txBuffer.array(), 0, limit)
+                    out.flush()
+                    val elapsedUs = ((System.nanoTime() - startNs) / 1000L).coerceAtLeast(1L)
+                    val prevEwma = ewmaWriteUs.get()
+                    ewmaWriteUs.set((prevEwma * 7L + elapsedUs) / 8L)
+                    lastTxMs.set(System.currentTimeMillis())
+                    txBytes.addAndGet(limit.toLong())
+                } catch (e: Exception) {
+                    android.util.Log.e("SoftEtherChannel", "Channel $channelId batch write failed: ${e.message}", e)
+                    isConnected.set(false)
+                    close()
+                    return
+                }
+            }
         }
     }
 
@@ -194,6 +383,7 @@ class SoftEtherChannel(
 
         val frameLen = 14 + length
         return synchronized(writeLock) {
+            val startNs = System.nanoTime()
             try {
                 txBuffer.clear()
                 txBuffer.putInt(1) // 1 frame
@@ -209,6 +399,10 @@ class SoftEtherChannel(
 
                 out.write(txBuffer.array(), 0, txBuffer.limit())
                 out.flush()
+                val elapsedUs = ((System.nanoTime() - startNs) / 1000L).coerceAtLeast(1L)
+                val prevEwma = ewmaWriteUs.get()
+                ewmaWriteUs.set((prevEwma * 7L + elapsedUs) / 8L)
+                lastTxMs.set(System.currentTimeMillis())
                 txBytes.addAndGet(txBuffer.limit().toLong())
                 true
             } catch (e: Exception) {
@@ -238,6 +432,7 @@ class SoftEtherChannel(
 
                 out.write(txBuffer.array(), 0, txBuffer.limit())
                 out.flush()
+                lastTxMs.set(System.currentTimeMillis())
                 txBytes.addAndGet(txBuffer.limit().toLong())
                 true
             } catch (e: Exception) {
@@ -262,6 +457,7 @@ class SoftEtherChannel(
                 txBuffer.flip()
                 out.write(txBuffer.array(), 0, txBuffer.limit())
                 out.flush()
+                lastTxMs.set(System.currentTimeMillis())
             } catch (e: Exception) {
                 android.util.Log.e("SoftEtherChannel", "Channel $channelId sendKeepalive failed: ${e.message}", e)
                 isConnected.set(false)
@@ -290,6 +486,7 @@ class SoftEtherChannel(
                     android.util.Log.w("SoftEtherChannel", "Channel $channelId readLoop EOF on numFrames")
                     break
                 }
+                lastRxMs.set(System.currentTimeMillis())
                 val numFrames = (((headerBuf[0].toInt() and 0xFF) shl 24) or
                         ((headerBuf[1].toInt() and 0xFF) shl 16) or
                         ((headerBuf[2].toInt() and 0xFF) shl 8) or
@@ -323,6 +520,7 @@ class SoftEtherChannel(
                         }
                         if (frameReadOk) {
                             rxBytes.addAndGet(frameLen.toLong())
+                            lastRxMs.set(System.currentTimeMillis())
                             onFrameReceived(rxFrameBuf, 0, frameLen)
                         } else {
                             android.util.Log.w("SoftEtherChannel", "Channel $channelId readLoop EOF on frameData len=$frameLen")
@@ -353,9 +551,12 @@ class SoftEtherChannel(
     }
 
     private fun buildHttpPost(target: String, host: String, body: ByteArray, contentType: String): ByteArray {
+        val ua = BROWSER_USER_AGENTS[(decoySeed.coerceAtLeast(0)) % BROWSER_USER_AGENTS.size]
         val headers = "POST $target HTTP/1.1\r\n" +
                 "Host: $host\r\n" +
-                "User-Agent: ${SoftEtherConstants.HTTP_DEFAULT_USER_AGENT}\r\n" +
+                "User-Agent: $ua\r\n" +
+                "Accept: */*\r\n" +
+                "Cache-Control: no-cache\r\n" +
                 "Content-Type: $contentType\r\n" +
                 "Content-Length: ${body.size}\r\n" +
                 "Connection: Keep-Alive\r\n" +
@@ -369,7 +570,6 @@ class SoftEtherChannel(
 
     private fun readHttpResponse(inStream: InputStream): HttpResponse {
         val headerBytes = mutableListOf<Byte>()
-        var foundSuffix = false
 
         while (true) {
             val b = inStream.read()
@@ -382,7 +582,6 @@ class SoftEtherChannel(
                 headerBytes[size - 2] == '\r'.code.toByte() &&
                 headerBytes[size - 1] == '\n'.code.toByte()
             ) {
-                foundSuffix = true
                 break
             }
         }
@@ -409,6 +608,9 @@ class SoftEtherChannel(
 
     fun close() {
         isConnected.set(false)
+        txSignal.release()
+        writerJob?.cancel()
+        writerJob = null
         try { transport?.close() } catch (_: Exception) {}
         transport = null
         input = null

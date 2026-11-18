@@ -152,6 +152,7 @@ fun SettingsScreen(
                                 )
                                 Text(
                                     text = when (proto) {
+                                        VpnProtocol.AUTO_SMART -> "تشخیص هوشمند فیلترینگ و انتخاب خودکار سریع‌ترین پروتکل (SoftEther / SSTP / WARP)"
                                         VpnProtocol.SOFTETHER_NATIVE -> "باندینگ چندکانکشن موازی TCP • بالاترین سرعت و مقاومت"
                                         VpnProtocol.SSTP -> "تونل استاندارد تک‌سوکت HTTPS برای سرورهای VPN Gate"
                                         VpnProtocol.WARP -> "شبکه Anycast پرسرعت کلودفلر با اسکنر خودکار Clean IP"
@@ -166,7 +167,7 @@ fun SettingsScreen(
             }
 
             // SoftEther Parallel Connections Slider
-            if (settings.vpnProtocol == VpnProtocol.SOFTETHER_NATIVE) {
+            if (settings.vpnProtocol == VpnProtocol.SOFTETHER_NATIVE || settings.vpnProtocol == VpnProtocol.AUTO_SMART) {
                 Card(
                     shape = RoundedCornerShape(14.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)

@@ -86,13 +86,18 @@ class MainActivity : ComponentActivity() {
             viewModel.addLog("Requesting VPN system consent...")
             vpnConsentLauncher.launch(intent)
         } else {
-            val isWarp = viewModel.settings.value.vpnProtocol == VpnProtocol.WARP
-            if (isWarp) {
-                Toast.makeText(this, "Connecting to Cloudflare WARP...", Toast.LENGTH_SHORT).show()
-            } else {
-                val server = viewModel.selectedServer.value ?: viewModel.servers.value.firstOrNull()
-                if (server != null) {
-                    Toast.makeText(this, "Connecting to ${server.countryLong.ifBlank { server.hostName }}...", Toast.LENGTH_SHORT).show()
+            when (viewModel.settings.value.vpnProtocol) {
+                VpnProtocol.WARP -> {
+                    Toast.makeText(this, "Connecting to Cloudflare WARP...", Toast.LENGTH_SHORT).show()
+                }
+                VpnProtocol.AUTO_SMART -> {
+                    Toast.makeText(this, "اتصال هوشمند به سریع‌ترین پروتکل ضد فیلتر...", Toast.LENGTH_SHORT).show()
+                }
+                else -> {
+                    val server = viewModel.selectedServer.value ?: viewModel.servers.value.firstOrNull()
+                    if (server != null) {
+                        Toast.makeText(this, "Connecting to ${server.countryLong.ifBlank { server.hostName }}...", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
             viewModel.connectSelectedServer()
@@ -195,7 +200,8 @@ fun MainAppContent(
                     onDisconnectClick = { viewModel.disconnect() },
                     onSwitchServerClick = { viewModel.switchToAnotherServer() },
                     onSelectServerClick = {
-                        if (settings.vpnProtocol == VpnProtocol.WARP) {
+                        val isWarpActive = vpnState.currentServer?.countryShort == "CF"
+                        if (settings.vpnProtocol == VpnProtocol.WARP || isWarpActive) {
                             viewModel.rescanWarpCleanIp()
                         } else {
                             navController.navigate(Screen.Servers.route) {

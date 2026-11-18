@@ -197,6 +197,7 @@ object CensorshipDetector {
                 add(SniStrategy.DISABLED)
             }
             add(SniStrategy.ZAPRET_SPLIT1_DESYNC)
+            add(SniStrategy.ADAPTIVE_HYBRID_DESYNC)
             add(SniStrategy.TLS_HEADER_DESYNC)
             add(SniStrategy.MULTI_CHUNK_FRAGMENTATION)
             if (!isCellular) {
@@ -361,7 +362,8 @@ object CensorshipDetector {
         if (SniStrategy.MULTI_CHUNK_FRAGMENTATION in passing ||
             SniStrategy.TLS_HEADER_DESYNC in passing ||
             SniStrategy.WINDOW_ALPN_MICRO_DESYNC in passing ||
-            SniStrategy.ZAPRET_SPLIT1_DESYNC in passing
+            SniStrategy.ZAPRET_SPLIT1_DESYNC in passing ||
+            SniStrategy.ADAPTIVE_HYBRID_DESYNC in passing
         ) {
             return FilterClassification.DEEP_CLIENTHELLO_DPI
         }

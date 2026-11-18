@@ -79,4 +79,44 @@ class SoftEtherClientTest {
         client.setProbeInterceptor { true }
         client.close()
     }
+
+    @Test
+    fun testMultiFrameBlockEncodingPacksMultipleFrames() {
+        val buf = java.nio.ByteBuffer.allocate(1024).order(java.nio.ByteOrder.BIG_ENDIAN)
+        val frames = arrayOf(
+            byteArrayOf(1, 2, 3, 4),
+            byteArrayOf(5, 6, 7, 8, 9, 10)
+        )
+        val lengths = intArrayOf(4, 6)
+        val indices = intArrayOf(0, 1)
+
+        val totalLen = SoftEtherChannel.encodeMultiFrameBlock(buf, frames, lengths, indices, 2)
+        // Expected: 4 (numFrames) + 4 (len0) + 4 + 4 (len1) + 6 = 22
+        assertEquals(22, totalLen)
+        assertEquals(2, buf.getInt())
+        assertEquals(4, buf.getInt())
+        val out0 = ByteArray(4).apply { buf.get(this) }
+        assertTrue(out0.contentEquals(frames[0]))
+        assertEquals(6, buf.getInt())
+        val out1 = ByteArray(6).apply { buf.get(this) }
+        assertTrue(out1.contentEquals(frames[1]))
+    }
+
+    @Test
+    fun testSelectPreferredChannelFailsOverFromUnhealthyChannel() {
+        val now = System.currentTimeMillis()
+        val ch0 = SoftEtherChannel(0, "h", "1.2.3.4", 443, true, SniStrategy.AUTO_SMART, null, false, null)
+        val ch1 = SoftEtherChannel(1, "h", "1.2.3.4", 443, false, SniStrategy.AUTO_SMART, null, false, null)
+        // Only ch1 is marked connected
+        ch1.isConnected.set(true)
+        ch1.lastRxMs.set(now)
+
+        val chosen = SoftEtherClient.selectPreferredChannelIndex(
+            channels = arrayOf(ch0, ch1),
+            flowHash = 0, // baseIdx = 0 (unhealthy ch0)
+            rrCursor = 0,
+            nowMs = now
+        )
+        assertEquals(1, chosen)
+    }
 }

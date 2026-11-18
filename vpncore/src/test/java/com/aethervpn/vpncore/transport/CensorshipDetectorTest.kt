@@ -199,5 +199,29 @@ class CensorshipDetectorTest {
         assertEquals(FilterClassification.DEEP_CLIENTHELLO_DPI, diagnosis.classification)
         assertEquals(SniStrategy.ZAPRET_SPLIT1_DESYNC, diagnosis.recommendedStrategy)
     }
+
+    @Test
+    fun classifiesAdaptiveHybridAsDeepClientHelloDpiAndRotatesDecoySnis() = runBlocking {
+        val executor = FakeProbeExecutor(
+            tcpReachable = true,
+            passingStrategies = setOf(SniStrategy.ADAPTIVE_HYBRID_DESYNC)
+        )
+        val diagnosis = CensorshipDetector.detectBestStrategy(
+            host = "hybrid-dpi.opengw.net",
+            ipAddress = InetAddress.getByName("203.0.113.13"),
+            port = 443,
+            networkProfile = "CELLULAR_MCI",
+            stopOnFirstWinner = true,
+            executor = executor
+        )
+
+        assertEquals(FilterClassification.DEEP_CLIENTHELLO_DPI, diagnosis.classification)
+        assertEquals(SniStrategy.ADAPTIVE_HYBRID_DESYNC, diagnosis.recommendedStrategy)
+
+        val picked = (0 until SniStrategy.DEFAULT_DECOY_SNIS.size)
+            .map { SniStrategy.pickDecoySni(it) }
+            .toSet()
+        assertEquals(SniStrategy.DEFAULT_DECOY_SNIS.toSet(), picked)
+    }
 }
 

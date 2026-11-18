@@ -19,6 +19,7 @@ import android.os.ParcelFileDescriptor
 import android.service.quicksettings.TileService
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.room.Room
 import com.aethervpn.client.BuildConfig
 import com.aethervpn.client.R
@@ -106,6 +107,8 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         const val EXTRA_SERVER_COUNTRY = "extra_server_country"
         const val EXTRA_SERVER_IS_CUSTOM = "extra_server_is_custom"
         const val EXTRA_SERVER_SNI = "extra_server_sni"
+        const val EXTRA_FORCE_PROTOCOL = "extra_force_protocol"
+        const val EXTRA_FROM_AUTO_SMART = "extra_from_auto_smart"
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "aether_vpn_channel"
 
@@ -126,7 +129,12 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         private val DNS_PROBE_CF = byteArrayOf(1, 1, 1, 1)
         private val DNS_PROBE_GOOGLE = byteArrayOf(8, 8, 8, 8)
 
-        fun buildConnectIntent(context: Context, server: VpnServer): Intent =
+        fun buildConnectIntent(
+            context: Context,
+            server: VpnServer,
+            forceProtocolId: Int = -1,
+            fromAutoSmart: Boolean = false
+        ): Intent =
             Intent(context, AetherVpnService::class.java).apply {
                 action = ACTION_CONNECT
                 putExtra(EXTRA_SERVER_HOST, server.hostName)
@@ -137,6 +145,8 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
                 putExtra(EXTRA_SERVER_COUNTRY, server.countryLong)
                 putExtra(EXTRA_SERVER_IS_CUSTOM, server.isCustom)
                 putExtra(EXTRA_SERVER_SNI, server.customSni)
+                putExtra(EXTRA_FORCE_PROTOCOL, forceProtocolId)
+                putExtra(EXTRA_FROM_AUTO_SMART, fromAutoSmart)
             }
 
         internal fun openServerDb(context: Context): AppDatabase = Room.databaseBuilder(
@@ -238,6 +248,8 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     private var attemptForceAbortReason: String? = null
     @Volatile
     private var attemptStrategyUsed: SniStrategy? = null
+    @Volatile
+    private var currentAttemptProtocol: VpnProtocol = VpnProtocol.SOFTETHER_NATIVE
 
     private var sessionStartTime = 0L
     private val totalTxBytes = AtomicLong(0)
@@ -348,6 +360,8 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
                 val country = intent.getStringExtra(EXTRA_SERVER_COUNTRY) ?: ""
                 val isCustom = intent.getBooleanExtra(EXTRA_SERVER_IS_CUSTOM, false)
                 val customSni = intent.getStringExtra(EXTRA_SERVER_SNI)
+                val forceProtocolId = intent.getIntExtra(EXTRA_FORCE_PROTOCOL, -1)
+                val fromAutoSmart = intent.getBooleanExtra(EXTRA_FROM_AUTO_SMART, false)
 
                 val server = VpnServer(
                     hostName = host,
@@ -365,13 +379,13 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
                     serviceScope.launch(Dispatchers.IO) {
                         val best = findBestStoredServer(this@AetherVpnService)
                         if (best != null && !ServerRepository.isRestrictedAcademicSubnet(best.ip) && !ServerRepository.isCensoredCountry(best.countryShort)) {
-                            startVpn(best)
+                            startVpn(best, forceProtocolId, fromAutoSmart)
                         } else {
-                            startVpn(server)
+                            startVpn(server, forceProtocolId, fromAutoSmart)
                         }
                     }
                 } else {
-                    startVpn(server)
+                    startVpn(server, forceProtocolId, fromAutoSmart)
                 }
             }
             ACTION_DISCONNECT -> {
@@ -381,7 +395,11 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         return START_NOT_STICKY
     }
 
-    private fun startVpn(server: VpnServer) {
+    private fun startVpn(
+        server: VpnServer,
+        forceProtocolId: Int = -1,
+        fromAutoSmart: Boolean = false
+    ) {
         val generation = synchronized(this) { activeGeneration + 1L }.also {
             activeGeneration = it
         }
@@ -425,7 +443,7 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         startMetricsReporting(generation)
 
         connectionJob = serviceScope.launch(Dispatchers.IO) {
-            runConnectionLoop(server, generation)
+            runConnectionLoop(server, generation, forceProtocolId, fromAutoSmart)
         }
     }
 
@@ -457,9 +475,15 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         }
     }
 
-    private suspend fun runConnectionLoop(initialServer: VpnServer, generation: Long) {
+    private suspend fun runConnectionLoop(
+        initialServer: VpnServer,
+        generation: Long,
+        forceProtocolId: Int = -1,
+        fromAutoSmart: Boolean = false
+    ) {
         val prefManager = PreferencesManager(applicationContext)
         val settings = prefManager.settingsFlow.first()
+        val effectiveProtocol = if (forceProtocolId >= 0) VpnProtocol.fromId(forceProtocolId) else settings.vpnProtocol
         activeSettings = settings
 
         if (settings.dnsMode != DnsMode.VPN_DEFAULT) {
@@ -511,11 +535,12 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
             resetAttemptFlags()
             cleanupActiveTunnelOnly()
 
-            val isSoftEther = settings.vpnProtocol == VpnProtocol.SOFTETHER_NATIVE
+            val isSoftEtherOrAuto = effectiveProtocol == VpnProtocol.SOFTETHER_NATIVE ||
+                effectiveProtocol == VpnProtocol.AUTO_SMART
             val profileKey = resolvePhysicalNetworkProfileKey()
             val isCellular = profileKey.contains("CELLULAR", ignoreCase = true) ||
                 profileKey.contains("MOBILE", ignoreCase = true)
-            val tryDirectFirst = (settings.sniStrategy == SniStrategy.AUTO_SMART || isSoftEther) &&
+            val tryDirectFirst = (settings.sniStrategy == SniStrategy.AUTO_SMART || isSoftEtherOrAuto) &&
                 !isCellular &&
                 !directAttemptedOnCurrentLink &&
                 !recoveringSameLinkSwitch
@@ -523,8 +548,7 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
                 !initialServer.isCustom &&
                 settings.autoFailover &&
                 settings.sniStrategy == SniStrategy.AUTO_SMART &&
-                !recoveringSameLinkSwitch &&
-                !isSoftEther
+                !recoveringSameLinkSwitch
             recoveringSameLinkSwitch = false
 
             var candidate: VpnServer? = null
@@ -542,6 +566,7 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
                 val ranClient = connectDirectThenSmartBypassFallback(
                     candidate = directTarget,
                     settings = settings,
+                    effectiveProtocol = effectiveProtocol,
                     profileKey = profileKey,
                     learnedProfiles = learnedProfiles,
                     generation = generation,
@@ -731,7 +756,7 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
             val ranClient = if (strategies.isEmpty()) {
                 false
             } else {
-                tryServerWithStrategies(candidate, settings, strategies, generation)
+                tryServerWithStrategies(candidate, settings, strategies, generation, effectiveProtocol = effectiveProtocol)
             }
 
             if (!isRunning.get() || userStopRequested.get() || activeGeneration != generation) {
@@ -765,6 +790,14 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         }
 
         if (isRunning.get() && activeGeneration == generation && !userStopRequested.get()) {
+            if (effectiveProtocol == VpnProtocol.AUTO_SMART && !fromAutoSmart && !initialServer.isCustom) {
+                VpnStateHolder.log("🔄 اتصال هوشمند: سرورهای VPN Gate در این شبکه مسدود بودند — انتقال خودکار به شبکه Anycast Cloudflare WARP...")
+                VpnStateHolder.updateConnectPhase(ConnectPhase.CONNECTING_WITH_BYPASS, "انتقال به Cloudflare WARP")
+                VpnStateHolder.updateStatus(VpnStatus.CONNECTING, "تغییر خودکار پروتکل به Cloudflare WARP...")
+                handoffToWarpService()
+                return
+            }
+
             val label = currentServer?.countryLong?.ifBlank { currentServer?.hostName ?: "" }.orEmpty()
             VpnStateHolder.updateConnectPhase(ConnectPhase.IDLE)
             VpnStateHolder.updateStatus(
@@ -777,28 +810,31 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     }
 
     /**
-     * Tries plain direct SSTP first; only when direct SSTP transport fails does it run
+     * Tries plain direct TLS first; only when direct transport fails does it run
      * [CensorshipDetector.detectBestStrategy] to identify filtering and retry with the winning bypass.
      */
     private suspend fun connectDirectThenSmartBypassFallback(
         candidate: VpnServer,
         settings: UserSettings,
+        effectiveProtocol: VpnProtocol,
         profileKey: String,
         learnedProfiles: MutableMap<String, String>,
         generation: Long,
         isReconnect: Boolean
     ): Boolean {
-        val isSoftEther = settings.vpnProtocol == VpnProtocol.SOFTETHER_NATIVE
+        val isSoftEtherOrAuto = effectiveProtocol == VpnProtocol.SOFTETHER_NATIVE ||
+            effectiveProtocol == VpnProtocol.AUTO_SMART
         val label = candidate.countryLong.ifBlank { candidate.hostName }
         val labelFa = VpnStateHolder.translateCountryToPersian(candidate.countryLong.ifBlank { candidate.countryShort })
         VpnStateHolder.updateConnectPhase(ConnectPhase.TRYING_DIRECT_SSTP)
-        if (isSoftEther) {
-            VpnStateHolder.updateLiveStatus("اتصال با پروتکل سافت‌ادر به سرور $labelFa...")
+        if (isSoftEtherOrAuto) {
+            val protoTag = if (effectiveProtocol == VpnProtocol.AUTO_SMART) "هوشمند" else "سافت‌ادر"
+            VpnStateHolder.updateLiveStatus("اتصال $protoTag به سرور $labelFa...")
             VpnStateHolder.updateStatus(
                 if (isReconnect) VpnStatus.RECONNECTING else VpnStatus.CONNECTING,
-                "Connecting via SoftEther Native on $label (${candidate.ip}) [$profileKey]..."
+                "Connecting ($protoTag) to $label (${candidate.ip}) [$profileKey]..."
             )
-            updateNotification("Connecting SoftEther ($label)...")
+            updateNotification("Connecting $protoTag ($label)...")
         } else {
             VpnStateHolder.updateLiveStatus("تست اتصال مستقیم به سرور $labelFa...")
             VpnStateHolder.updateStatus(
@@ -813,17 +849,14 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
             settings = settings,
             strategies = listOf(SniStrategy.DIRECT_IP_NO_SNI, SniStrategy.DISABLED),
             generation = generation,
-            connectTimeoutMs = if (isSoftEther) 10000 else DIRECT_SSTP_FIRST_TIMEOUT_MS
+            connectTimeoutMs = if (isSoftEtherOrAuto) 3500 else DIRECT_SSTP_FIRST_TIMEOUT_MS,
+            effectiveProtocol = effectiveProtocol
         )
         if (!isRunning.get() || userStopRequested.get() || activeGeneration != generation || networkSwitchRequested.get()) {
             return directOk
         }
         if (directOk && attemptVerifiedInternet) {
             return true
-        }
-
-        if (isSoftEther) {
-            return directOk
         }
 
         // Bypassing SNI cannot recover an authenticated tunnel that was blackholed or rejected at HTTP/MS-CHAPv2
@@ -949,7 +982,13 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
 
         resetAttemptFlags()
         cleanupActiveTunnelOnly()
-        return tryServerWithStrategies(effectiveCandidate, settings, bypassStrategies, generation)
+        return tryServerWithStrategies(
+            candidate = effectiveCandidate,
+            settings = settings,
+            strategies = bypassStrategies,
+            generation = generation,
+            effectiveProtocol = effectiveProtocol
+        )
     }
 
     private suspend fun handlePostAttemptOutcome(
@@ -1028,7 +1067,11 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     }
 
     private fun resolvePhysicalNetworkProfileKey(): String {
-        return VpnStateHolder.resolveNetworkProfileKey(connectivityManager, activePhysicalNetwork)
+        return VpnStateHolder.resolveNetworkProfileKey(
+            cm = connectivityManager,
+            preferredNetwork = activePhysicalNetwork,
+            context = applicationContext
+        )
     }
 
     private fun resolveEffectiveCustomSni(candidate: VpnServer, settings: UserSettings): String? {
@@ -1251,186 +1294,261 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         settings: UserSettings,
         strategies: List<SniStrategy>,
         generation: Long,
-        connectTimeoutMs: Int = FAILOVER_HANDSHAKE_TIMEOUT_MS
+        connectTimeoutMs: Int = FAILOVER_HANDSHAKE_TIMEOUT_MS,
+        effectiveProtocol: VpnProtocol = settings.vpnProtocol
     ): Boolean {
+        val protocolsForCandidate = when (effectiveProtocol) {
+            VpnProtocol.AUTO_SMART -> listOf(VpnProtocol.SOFTETHER_NATIVE, VpnProtocol.SSTP)
+            VpnProtocol.SOFTETHER_NATIVE -> listOf(VpnProtocol.SOFTETHER_NATIVE)
+            VpnProtocol.SSTP, VpnProtocol.WARP -> listOf(VpnProtocol.SSTP)
+        }
+
         for (strategy in strategies) {
             if (!isRunning.get() || userStopRequested.get() || activeGeneration != generation) {
                 return false
             }
             if (attemptForceAbortReason != null || networkSwitchRequested.get()) {
-                // Server already completed TLS/SSTP handshake and then failed health/stalled/switched; skip strategy retries
+                // Server already completed TLS handshake and then failed health/stalled/switched; skip strategy retries
                 return true
             }
 
-            try {
-                currentStrategyName = strategy.name
-                attemptStrategyUsed = strategy
-                val effectiveMtu = effectiveMtuForActiveLink(settings.mtu)
-                VpnStateHolder.log("Trying ${candidate.ip}:${candidate.customPort} (Strategy: $strategy, MTU: $effectiveMtu)...")
-
-                val inetAddr = InetAddress.getByName(candidate.ip)
-                val customSniOverride = resolveEffectiveCustomSni(candidate, settings)
-
-                if (settings.vpnProtocol == VpnProtocol.SOFTETHER_NATIVE) {
-                    val effectivePort = if (candidate.customPort in 1..65535) candidate.customPort else 443
-                    val hubName = if (candidate.isCustom) "DEFAULT" else "VPNGATE"
-                    val user = if (candidate.isCustom) candidate.customUsername.ifBlank { "vpn" } else "vpn"
-                    val pass = if (candidate.isCustom) candidate.customPassword.ifBlank { "vpn" } else "vpn"
-
-                    val seConfig = SoftEtherConfig(
-                        host = candidate.hostName.ifBlank { candidate.ip },
-                        ipAddress = candidate.ip,
-                        port = effectivePort,
-                        username = user,
-                        password = pass,
-                        hubName = hubName,
-                        targetConnections = settings.softEtherConnections.coerceIn(1, 16),
-                        sniStrategy = strategy,
-                        customSni = customSniOverride,
-                        strictCert = settings.strictCert,
-                        connectTimeoutMs = connectTimeoutMs,
-                        mtu = effectiveMtu
-                    )
-
-                    val client = SoftEtherClient(
-                        config = seConfig,
-                        socketProtector = this@AetherVpnService,
-                        listener = object : SoftEtherEventListener {
-                            override fun onStateChanged(state: SoftEtherState, message: String) {
-                                if (userStopRequested.get() || !isRunning.get()) return
-                                when (state) {
-                                    SoftEtherState.CONNECTING_PRIMARY -> {
-                                        VpnStateHolder.updateConnectPhase(ConnectPhase.CONNECTING_WITH_BYPASS)
-                                        VpnStateHolder.updateStatus(VpnStatus.CONNECTING, message)
-                                        updateNotification(message)
-                                    }
-                                    SoftEtherState.AUTHENTICATING -> {
-                                        VpnStateHolder.updateConnectPhase(ConnectPhase.CONNECTING_WITH_BYPASS)
-                                        VpnStateHolder.updateStatus(VpnStatus.AUTHENTICATING, message)
-                                        updateNotification(message)
-                                    }
-                                    SoftEtherState.ESTABLISHING_CHANNELS -> {
-                                        VpnStateHolder.updateStatus(VpnStatus.CONNECTING, message)
-                                        updateNotification(message)
-                                    }
-                                    SoftEtherState.NEGOTIATING_DHCP -> {
-                                        VpnStateHolder.updateStatus(VpnStatus.AUTHENTICATING, message)
-                                        updateNotification(message)
-                                    }
-                                    SoftEtherState.CONNECTED,
-                                    SoftEtherState.DISCONNECTING,
-                                    SoftEtherState.DISCONNECTED -> {}
-                                }
-                            }
-
-                            override fun onConnected(params: SoftEtherVpnParameters) {
-                                if (userStopRequested.get() || !isRunning.get()) return
-                                val server = currentServer ?: return
-                                val vpnParams = VpnParameters(
-                                    clientIp = params.clientIp,
-                                    gatewayIp = params.gateway,
-                                    primaryDns = params.dnsServers.getOrNull(0) ?: "8.8.8.8",
-                                    secondaryDns = params.dnsServers.getOrNull(1) ?: "8.8.4.4",
-                                    mtu = params.mtu
-                                )
-                                latestParams = vpnParams
-                                establishTun(vpnParams, activeSettings)
-
-                                val srvCountryFa = VpnStateHolder.translateCountryToPersian(server.countryLong.ifBlank { server.countryShort })
-                                VpnStateHolder.updateConnectPhase(ConnectPhase.VERIFYING_INTERNET)
-                                VpnStateHolder.updateLiveStatus("بررسی دسترسی آزاد به اینترنت سرور $srvCountryFa (سافت‌ادر ${params.activeChannels} کانکشن)...")
-                                VpnStateHolder.updateStatus(
-                                    VpnStatus.AUTHENTICATING,
-                                    "Verifying real internet on ${server.countryLong.ifBlank { server.ip }} via SoftEther (${params.activeChannels} Ch)..."
-                                )
-                                updateNotification("Verifying internet...")
-
-                                verifyJob?.cancel()
-                                verifyJob = serviceScope.launch(Dispatchers.IO) {
-                                    val activeClient = activeTunnelClient ?: return@launch
-                                    verifyAndPromoteSession(
-                                        client = activeClient,
-                                        server = server,
-                                        params = vpnParams,
-                                        strategy = strategy,
-                                        connectedMsg = "${params.clientIp} (${params.activeChannels} TCP Ch)",
-                                        generation = generation
-                                    )
-                                }
-                            }
-
-                            override fun onDisconnected(reason: String) {
-                                VpnStateHolder.log("SoftEther: $reason")
-                            }
-
-                            override fun onError(e: Exception) {
-                                val msg = e.message ?: e.javaClass.simpleName
-                                attemptFailureReason = msg
-                                VpnStateHolder.log("SoftEther error: $msg")
-                            }
-
-                            override fun onIpPacketReceived(packet: ByteArray, offset: Int, length: Int) {
-                                onDataPacketReceived(packet, offset, length)
-                            }
-
-                            override fun onBytesTransferred(txBytesDelta: Long, rxBytesDelta: Long) {
-                                totalTxBytes.addAndGet(txBytesDelta)
-                                totalRxBytes.addAndGet(rxBytesDelta)
-                            }
-
-                            override fun onLog(message: String) {
-                                VpnStateHolder.log(message)
-                            }
-                        }
-                    )
-                    client.setProbeInterceptor { packet -> interceptProbeDnsReply(packet) }
-                    activeTunnelClient = client
-                    client.start(serviceScope)
-                    return true
-                } else {
-                    val sstpConfig = SstpConfig(
-                        host = candidate.ip,
-                        ipAddress = inetAddr,
-                        port = candidate.customPort,
-                        username = candidate.customUsername,
-                        password = candidate.customPassword,
-                        mtu = effectiveMtu,
-                        keepaliveIntervalSec = settings.keepaliveSec,
-                        strictCert = settings.strictCert,
-                        sniStrategy = strategy,
-                        customSni = customSniOverride,
-                        connectTimeoutMs = connectTimeoutMs
-                    )
-
-                    val client = SstpClient(
-                        config = sstpConfig,
-                        socketProtector = this@AetherVpnService,
-                        listener = this@AetherVpnService
-                    )
-                    client.setProbeInterceptor { packet -> interceptProbeDnsReply(packet) }
-                    activeTunnelClient = client
-                    client.start(serviceScope)
-                    return true
-                }
-            } catch (e: CancellationException) {
-                throw e
+            val inetAddr = try {
+                InetAddress.getByName(candidate.ip)
             } catch (e: Exception) {
-                val msg = e.message ?: e.javaClass.simpleName
-                attemptFailureReason = msg
-                VpnStateHolder.log("Strategy $strategy error: $msg")
+                attemptFailureReason = "Invalid host IP: ${candidate.ip}"
+                return false
+            }
+            val effectiveMtu = effectiveMtuForActiveLink(settings.mtu)
+            val customSniOverride = resolveEffectiveCustomSni(candidate, settings)
 
-                val isDefinitiveAuthFailure = (strategy == SniStrategy.DIRECT_IP_NO_SNI || strategy == SniStrategy.DISABLED) &&
-                    isNonTransportFailure(msg)
-                if (isDefinitiveAuthFailure) {
-                    VpnStateHolder.log("Server ${candidate.ip} rejected SSTP/auth on direct transport; skipping remaining SNI retries.")
+            for ((protoIdx, proto) in protocolsForCandidate.withIndex()) {
+                if (!isRunning.get() || userStopRequested.get() || activeGeneration != generation) {
                     return false
                 }
-                if (isRunning.get() && !userStopRequested.get()) {
-                    delay(350)
+                if (attemptForceAbortReason != null || networkSwitchRequested.get()) {
+                    return true
+                }
+
+                try {
+                    currentAttemptProtocol = proto
+                    currentStrategyName = "${proto.shortTag()} • ${strategy.name}"
+                    attemptStrategyUsed = strategy
+                    VpnStateHolder.log("Trying ${candidate.ip}:${candidate.customPort} (Proto: $proto, Strategy: $strategy, MTU: $effectiveMtu)...")
+
+                    if (proto == VpnProtocol.SOFTETHER_NATIVE) {
+                        val effectivePort = if (candidate.customPort in 1..65535) candidate.customPort else 443
+                        val hubName = if (candidate.isCustom) "DEFAULT" else "VPNGATE"
+                        val user = if (candidate.isCustom) candidate.customUsername.ifBlank { "vpn" } else "vpn"
+                        val pass = if (candidate.isCustom) candidate.customPassword.ifBlank { "vpn" } else "vpn"
+                        val targetCh = if (effectiveProtocol == VpnProtocol.AUTO_SMART) {
+                            maxOf(settings.softEtherConnections, 4).coerceIn(1, 16)
+                        } else {
+                            settings.softEtherConnections.coerceIn(1, 16)
+                        }
+
+                        val seConfig = SoftEtherConfig(
+                            host = candidate.hostName.ifBlank { candidate.ip },
+                            ipAddress = candidate.ip,
+                            port = effectivePort,
+                            username = user,
+                            password = pass,
+                            hubName = hubName,
+                            targetConnections = targetCh,
+                            sniStrategy = strategy,
+                            customSni = customSniOverride,
+                            strictCert = settings.strictCert,
+                            connectTimeoutMs = connectTimeoutMs,
+                            mtu = effectiveMtu
+                        )
+
+                        val client = SoftEtherClient(
+                            config = seConfig,
+                            socketProtector = this@AetherVpnService,
+                            listener = object : SoftEtherEventListener {
+                                override fun onStateChanged(state: SoftEtherState, message: String) {
+                                    if (userStopRequested.get() || !isRunning.get()) return
+                                    when (state) {
+                                        SoftEtherState.CONNECTING_PRIMARY -> {
+                                            VpnStateHolder.updateConnectPhase(ConnectPhase.CONNECTING_WITH_BYPASS)
+                                            VpnStateHolder.updateStatus(VpnStatus.CONNECTING, message)
+                                            updateNotification(message)
+                                        }
+                                        SoftEtherState.AUTHENTICATING -> {
+                                            VpnStateHolder.updateConnectPhase(ConnectPhase.CONNECTING_WITH_BYPASS)
+                                            VpnStateHolder.updateStatus(VpnStatus.AUTHENTICATING, message)
+                                            updateNotification(message)
+                                        }
+                                        SoftEtherState.ESTABLISHING_CHANNELS -> {
+                                            VpnStateHolder.updateStatus(VpnStatus.CONNECTING, message)
+                                            updateNotification(message)
+                                        }
+                                        SoftEtherState.NEGOTIATING_DHCP -> {
+                                            VpnStateHolder.updateStatus(VpnStatus.AUTHENTICATING, message)
+                                            updateNotification(message)
+                                        }
+                                        SoftEtherState.CONNECTED,
+                                        SoftEtherState.DISCONNECTING,
+                                        SoftEtherState.DISCONNECTED -> {}
+                                    }
+                                }
+
+                                override fun onConnected(params: SoftEtherVpnParameters) {
+                                    if (userStopRequested.get() || !isRunning.get()) return
+                                    val server = currentServer ?: return
+                                    val vpnParams = VpnParameters(
+                                        clientIp = params.clientIp,
+                                        gatewayIp = params.gateway,
+                                        primaryDns = params.dnsServers.getOrNull(0) ?: "8.8.8.8",
+                                        secondaryDns = params.dnsServers.getOrNull(1) ?: "8.8.4.4",
+                                        mtu = params.mtu
+                                    )
+                                    latestParams = vpnParams
+                                    establishTun(vpnParams, activeSettings)
+
+                                    val srvCountryFa = VpnStateHolder.translateCountryToPersian(server.countryLong.ifBlank { server.countryShort })
+                                    VpnStateHolder.updateConnectPhase(ConnectPhase.VERIFYING_INTERNET)
+                                    VpnStateHolder.updateLiveStatus("بررسی دسترسی آزاد به اینترنت سرور $srvCountryFa (سافت‌ادر ${params.activeChannels} کانکشن)...")
+                                    VpnStateHolder.updateStatus(
+                                        VpnStatus.AUTHENTICATING,
+                                        "Verifying real internet on ${server.countryLong.ifBlank { server.ip }} via SoftEther (${params.activeChannels} Ch)..."
+                                    )
+                                    updateNotification("Verifying internet...")
+
+                                    verifyJob?.cancel()
+                                    verifyJob = serviceScope.launch(Dispatchers.IO) {
+                                        val activeClient = activeTunnelClient ?: return@launch
+                                        verifyAndPromoteSession(
+                                            client = activeClient,
+                                            server = server,
+                                            params = vpnParams,
+                                            strategy = strategy,
+                                            connectedMsg = "${params.clientIp} (${params.activeChannels} TCP Ch)",
+                                            generation = generation
+                                        )
+                                    }
+                                }
+
+                                override fun onDisconnected(reason: String) {
+                                    VpnStateHolder.log("SoftEther: $reason")
+                                }
+
+                                override fun onError(e: Exception) {
+                                    val msg = e.message ?: e.javaClass.simpleName
+                                    attemptFailureReason = msg
+                                    VpnStateHolder.log("SoftEther error: $msg")
+                                }
+
+                                override fun onIpPacketReceived(packet: ByteArray, offset: Int, length: Int) {
+                                    onDataPacketReceived(packet, offset, length)
+                                }
+
+                                override fun onBytesTransferred(txBytesDelta: Long, rxBytesDelta: Long) {
+                                    totalTxBytes.addAndGet(txBytesDelta)
+                                    totalRxBytes.addAndGet(rxBytesDelta)
+                                }
+
+                                override fun onLog(message: String) {
+                                    VpnStateHolder.log(message)
+                                }
+                            }
+                        )
+                        client.setPacketProbeInterceptor { buf, off, len -> interceptProbeDnsReply(buf, off, len) }
+                        activeTunnelClient = client
+                        client.start(serviceScope)
+                        return true
+                    } else {
+                        val sstpConfig = SstpConfig(
+                            host = candidate.ip,
+                            ipAddress = inetAddr,
+                            port = candidate.customPort,
+                            username = candidate.customUsername,
+                            password = candidate.customPassword,
+                            mtu = effectiveMtu,
+                            keepaliveIntervalSec = settings.keepaliveSec,
+                            strictCert = settings.strictCert,
+                            sniStrategy = strategy,
+                            customSni = customSniOverride,
+                            connectTimeoutMs = connectTimeoutMs
+                        )
+
+                        val client = SstpClient(
+                            config = sstpConfig,
+                            socketProtector = this@AetherVpnService,
+                            listener = this@AetherVpnService
+                        )
+                        client.setPacketProbeInterceptor { buf, off, len -> interceptProbeDnsReply(buf, off, len) }
+                        activeTunnelClient = client
+                        client.start(serviceScope)
+                        return true
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    val msg = e.message ?: e.javaClass.simpleName
+                    attemptFailureReason = msg
+                    VpnStateHolder.log("Proto $proto / Strategy $strategy error: $msg")
+
+                    // In AUTO_SMART, if SoftEther Native fails due to hub/protocol/auth mismatch, fall back seamlessly to SSTP on same server
+                    val hasNextProto = protoIdx < protocolsForCandidate.lastIndex
+                    if (hasNextProto && isRunning.get() && !userStopRequested.get() && !networkSwitchRequested.get()) {
+                        VpnStateHolder.log("SoftEther Native failed on ${candidate.ip} ($msg); falling back to SSTP with $strategy...")
+                        cleanupActiveTunnelOnly()
+                        attemptFailureReason = null
+                        continue
+                    }
+
+                    val isDefinitiveAuthFailure = (strategy == SniStrategy.DIRECT_IP_NO_SNI || strategy == SniStrategy.DISABLED) &&
+                        isNonTransportFailure(msg)
+                    if (isDefinitiveAuthFailure) {
+                        VpnStateHolder.log("Server ${candidate.ip} rejected tunnel/auth on direct transport; skipping remaining SNI retries.")
+                        return false
+                    }
+                    if (isRunning.get() && !userStopRequested.get()) {
+                        delay(300)
+                    }
                 }
             }
         }
         return false
+    }
+
+    private fun VpnProtocol.shortTag(): String = when (this) {
+        VpnProtocol.SOFTETHER_NATIVE -> "SoftEther-TCP"
+        VpnProtocol.SSTP -> "SSTP"
+        VpnProtocol.WARP -> "WARP"
+        VpnProtocol.AUTO_SMART -> "AutoSmart"
+    }
+
+    private fun handoffToWarpService() {
+        isFailoverTransition.set(true)
+        if (!isRunning.compareAndSet(true, false)) return
+        activeGeneration++
+        metricsJob?.cancel()
+        metricsJob = null
+        cleanupActiveTunnelOnly()
+        val dotToClose = dotClient
+        dotClient = null
+        serviceScope.launch(Dispatchers.IO) {
+            try { dotToClose?.close() } catch (_: Exception) {}
+        }
+        if (callbackRegistered.compareAndSet(true, false)) {
+            try { connectivityManager.unregisterNetworkCallback(networkCallback) } catch (_: Exception) {}
+        }
+        activePhysicalNetwork = null
+        lastPhysicalNetwork = null
+        availablePhysicalNetworks.clear()
+
+        try {
+            ContextCompat.startForegroundService(
+                applicationContext,
+                WarpService.buildConnectIntent(applicationContext, fromAutoSmart = true)
+            )
+        } catch (e: Exception) {
+            VpnStateHolder.log("Failed to start WARP handoff: ${e.message}")
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        requestTileRefresh()
     }
 
     override fun onStateChanged(state: SstpState, message: String?) {
@@ -1506,7 +1624,9 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         val profileKey = resolvePhysicalNetworkProfileKey()
         strategy?.let { used ->
             try {
-                PreferencesManager(applicationContext).updateVpnBypassProfile(profileKey, used.name)
+                val pref = PreferencesManager(applicationContext)
+                pref.updateVpnBypassProfile(profileKey, used.name)
+                pref.updateVpnProtocolProfile(profileKey, currentAttemptProtocol.name)
             } catch (_: Exception) {}
         }
 
@@ -1534,88 +1654,83 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         params: VpnParameters,
         settings: UserSettings
     ): Boolean {
-        // Fast path 1: Direct HTTP and Telegram connectivity check via established VPN interface (verifies real TCP routing)
+        // Fast path 1: First-success parallel HTTP/Telegram/Instagram connectivity check via established VPN interface
         if (isAppPackageRoutedViaVpn(settings)) {
-            delay(100)
-            val (httpReachable, telegramReachable, instagramReachable) = coroutineScope {
-                val httpJob = async(Dispatchers.IO) {
-                    withTimeoutOrNull(5000L) {
-                        val probeUrls = listOf(
-                            "http://connectivitycheck.gstatic.com/generate_204",
-                            "https://1.1.1.1/cdn-cgi/trace"
-                        )
-                        coroutineScope {
-                            probeUrls.map { url ->
-                                async {
-                                    try {
-                                        val req = Request.Builder().url(url).build()
-                                        val code = httpClient.newCall(req).execute().use { it.code }
-                                        code in 200..499
-                                    } catch (_: Exception) {
-                                        false
-                                    }
+            delay(80)
+            val resultChannel = Channel<Boolean>(Channel.UNLIMITED)
+            val verified = coroutineScope {
+                val probeJobs = buildList {
+                    listOf(
+                        "http://connectivitycheck.gstatic.com/generate_204",
+                        "https://1.1.1.1/cdn-cgi/trace"
+                    ).forEach { url ->
+                        add(async(Dispatchers.IO) {
+                            val ok = try {
+                                val req = Request.Builder().url(url).build()
+                                httpClient.newCall(req).execute().use { it.code in 200..499 }
+                            } catch (_: Exception) {
+                                false
+                            }
+                            resultChannel.trySend(ok)
+                        })
+                    }
+
+                    listOf(
+                        java.net.InetSocketAddress("149.154.167.50", 443),
+                        java.net.InetSocketAddress("149.154.167.91", 443),
+                        java.net.InetSocketAddress("91.108.56.165", 443)
+                    ).forEach { endpoint ->
+                        add(async(Dispatchers.IO) {
+                            val ok = try {
+                                java.net.Socket().use { s ->
+                                    s.connect(endpoint, 3200)
+                                    true
                                 }
-                            }.any { it.await() }
-                        }
-                    } ?: false
+                            } catch (_: Exception) {
+                                false
+                            }
+                            resultChannel.trySend(ok)
+                        })
+                    }
+
+                    listOf(
+                        java.net.InetSocketAddress("157.240.241.63", 443),
+                        java.net.InetSocketAddress("157.240.1.63", 443)
+                    ).forEach { endpoint ->
+                        add(async(Dispatchers.IO) {
+                            val ok = try {
+                                java.net.Socket().use { s ->
+                                    s.connect(endpoint, 3200)
+                                    true
+                                }
+                            } catch (_: Exception) {
+                                false
+                            }
+                            resultChannel.trySend(ok)
+                        })
+                    }
                 }
 
-                val telegramJob = async(Dispatchers.IO) {
-                    withTimeoutOrNull(5000L) {
-                        val telegramEndpoints = listOf(
-                            java.net.InetSocketAddress("149.154.167.50", 443),
-                            java.net.InetSocketAddress("149.154.167.91", 443),
-                            java.net.InetSocketAddress("149.154.167.92", 443),
-                            java.net.InetSocketAddress("91.108.56.165", 443)
-                        )
-                        coroutineScope {
-                            telegramEndpoints.map { endpoint ->
-                                async {
-                                    try {
-                                        java.net.Socket().use { s ->
-                                            s.connect(endpoint, 4000)
-                                            true
-                                        }
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                }
-                            }.any { it.await() }
+                var firstSuccess = false
+                var completed = 0
+                val total = probeJobs.size
+                val outcome = withTimeoutOrNull(3800L) {
+                    while (completed < total) {
+                        if (resultChannel.receive()) {
+                            firstSuccess = true
+                            break
                         }
-                    } ?: false
-                }
+                        completed++
+                    }
+                    firstSuccess
+                } ?: false
 
-                val instagramJob = async(Dispatchers.IO) {
-                    withTimeoutOrNull(5000L) {
-                        val instagramEndpoints = listOf(
-                            java.net.InetSocketAddress("157.240.241.63", 443),
-                            java.net.InetSocketAddress("157.240.1.63", 443),
-                            java.net.InetSocketAddress("31.13.72.36", 443)
-                        )
-                        coroutineScope {
-                            instagramEndpoints.map { endpoint ->
-                                async {
-                                    try {
-                                        java.net.Socket().use { s ->
-                                            s.connect(endpoint, 4000)
-                                            true
-                                        }
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                }
-                            }.any { it.await() }
-                        }
-                    } ?: false
-                }
-
-                Triple(httpJob.await(), telegramJob.await(), instagramJob.await())
+                probeJobs.forEach { it.cancel() }
+                outcome
             }
 
-            VpnStateHolder.log("Tunnel verification: HTTP=$httpReachable, TG=$telegramReachable, IG=$instagramReachable")
-
-            if (httpReachable || telegramReachable || instagramReachable) {
-                VpnStateHolder.log("Connectivity verified (TG=$telegramReachable, IG=$instagramReachable, HTTP=$httpReachable).")
+            if (verified) {
+                VpnStateHolder.log("Tunnel verification succeeded (fast first-response).")
                 return true
             } else {
                 VpnStateHolder.log("Tunnel verification failed: all probes failed; failing over...")
@@ -1688,9 +1803,13 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         }
     }
 
-    private fun interceptProbeDnsReply(packet: ByteArray): Boolean {
+    private fun interceptProbeDnsReply(
+        packet: ByteArray,
+        offset: Int = 0,
+        length: Int = packet.size
+    ): Boolean {
         if (pendingDnsProbes.isEmpty()) return false
-        val udp = TunnelPackets.extractUdpHeader(packet) ?: return false
+        val udp = TunnelPackets.extractUdpHeader(packet, offset, length) ?: return false
         if (udp.srcPort != 53 || udp.payloadLength < 12) return false
         val deferred = pendingDnsProbes.remove(udp.dstPort) ?: return false
         val dnsPayload = packet.copyOfRange(udp.payloadOffset, udp.payloadOffset + udp.payloadLength)
@@ -1995,7 +2114,20 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     ): ByteArray? {
         val parsedDns = query.parsed
         val routeBucket = if (query.isIranDomain) DNS_BUCKET_DIRECT else DNS_BUCKET_TUNNEL
-        dnsCache.get(parsedDns.dnsPayload, routeBucket)?.let { return it }
+        val cached = dnsCache.getWithStale(parsedDns.dnsPayload, routeBucket)
+        if (cached != null) {
+            if (cached.isStale) {
+                val gen = activeGeneration
+                serviceScope.launch(Dispatchers.IO) {
+                    if (!isRunning.get() || activeGeneration != gen) return@launch
+                    val refreshed = resolveUncachedDnsQuery(query, clientIpBytes, settings, dotFailCount)
+                    if (refreshed != null && refreshed.size >= 12) {
+                        dnsCache.put(parsedDns.dnsPayload, refreshed, routeBucket)
+                    }
+                }
+            }
+            return cached.wireResponse
+        }
 
         val resolved: ByteArray? = resolveUncachedDnsQuery(query, clientIpBytes, settings, dotFailCount)
         if (resolved != null && resolved.size >= 12) {

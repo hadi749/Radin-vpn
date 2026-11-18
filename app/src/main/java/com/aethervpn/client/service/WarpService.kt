@@ -40,6 +40,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
@@ -97,7 +98,8 @@ class WarpService : Service() {
 
         when (intent?.action) {
             ACTION_CONNECT -> {
-                startWarpTunnel()
+                val fromAutoSmart = intent.getBooleanExtra(EXTRA_FROM_AUTO_SMART, false)
+                startWarpTunnel(fromAutoSmart = fromAutoSmart)
             }
             ACTION_DISCONNECT -> {
                 disconnectWarp()
@@ -109,7 +111,7 @@ class WarpService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startWarpTunnel() {
+    private fun startWarpTunnel(fromAutoSmart: Boolean = false) {
         tunnelJob?.cancel()
         tunnelJob = serviceScope.launch {
             try {
@@ -118,18 +120,20 @@ class WarpService : Service() {
                 updateNotification("در حال اسکن آی‌پی تمیز کلودفلر...")
 
                 val settings = preferencesManager.settingsFlow.first()
+                val profileKey = VpnStateHolder.resolveNetworkProfileKey(connectivityManager, null, applicationContext)
 
                 // Step 1: Discover top candidate clean Anycast IPs paired with diverse ports
                 val candidateEndpoints = CloudflareCleanIpScanner.findTopCleanEndpoints(
                     targetPort = settings.warpPort.takeIf { it > 0 } ?: 2408,
-                    timeoutMs = 950,
-                    sampleSize = 24,
-                    maxResults = 4
+                    timeoutMs = 750,
+                    sampleSize = 28,
+                    maxResults = 5
                 ).ifEmpty {
                     listOf(
                         CleanEndpoint(ip = "188.114.97.1", port = settings.warpPort.takeIf { it > 0 } ?: 2408, pingMs = 45),
                         CleanEndpoint(ip = "162.159.192.1", port = 500, pingMs = 60),
-                        CleanEndpoint(ip = "188.114.96.1", port = 1701, pingMs = 55)
+                        CleanEndpoint(ip = "188.114.96.1", port = 1701, pingMs = 55),
+                        CleanEndpoint(ip = "162.159.193.1", port = 4500, pingMs = 65)
                     )
                 }
 
@@ -193,20 +197,36 @@ class WarpService : Service() {
 
                 if (activeSuccessEndpoint == null) {
                     VpnStateHolder.log("⚠️ تمامی پورت‌ها و گره‌های Anycast کلودفلر توسط اپراتور مسدود شده‌اند.")
-                    VpnStateHolder.log("🔄 اتصال هوشمند رادین: در حال جابجایی خودکار به پروتکل قدرتمند SoftEther SSTP (با دور زدن فیلترینگ Zapret)...")
-                    VpnStateHolder.updateStatus(VpnStatus.CONNECTING, "مسدودی UDP؛ جابجایی خودکار به SSTP ضد فیلتر...")
-                    updateNotification("مسدودی UDP؛ اتصال به سرور ضد فیلتر...")
-
                     teardownWireGuardSilently()
 
-                    // Automatically update preference to SSTP so future connections start directly with SSTP
-                    preferencesManager.updateVpnProtocol(VpnProtocol.SSTP)
+                    if (fromAutoSmart) {
+                        VpnStateHolder.updateStatus(
+                            VpnStatus.ERROR,
+                            "تمامی پروتکل‌ها (SoftEther / SSTP / WARP) در این شبکه مسدود هستند."
+                        )
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                        return@launch
+                    }
+
+                    VpnStateHolder.log("🔄 اتصال هوشمند رادین: جابجایی خودکار به SoftEther Native Multi-TCP (با دور زدن فیلترینگ DPI)...")
+                    VpnStateHolder.updateStatus(VpnStatus.CONNECTING, "مسدودی UDP؛ جابجایی خودکار به SoftEther...")
+                    updateNotification("مسدودی UDP؛ اتصال به سرور ضد فیلتر...")
+
+                    if (settings.vpnProtocol == VpnProtocol.WARP) {
+                        preferencesManager.updateVpnProtocol(VpnProtocol.AUTO_SMART)
+                    }
 
                     val fallbackServer = AetherVpnService.findBestStoredServer(applicationContext)
                     if (fallbackServer != null) {
                         VpnStateHolder.log("🚀 شروع اتصال خودکار به سرور ضد فیلتر: ${fallbackServer.countryLong.ifBlank { fallbackServer.hostName }} (${fallbackServer.ip})")
-                        val sstpIntent = AetherVpnService.buildConnectIntent(applicationContext, fallbackServer)
-                        ContextCompat.startForegroundService(applicationContext, sstpIntent)
+                        val fallbackIntent = AetherVpnService.buildConnectIntent(
+                            context = applicationContext,
+                            server = fallbackServer,
+                            forceProtocolId = VpnProtocol.SOFTETHER_NATIVE.id,
+                            fromAutoSmart = true
+                        )
+                        ContextCompat.startForegroundService(applicationContext, fallbackIntent)
                     } else {
                         VpnStateHolder.updateStatus(VpnStatus.ERROR, "پروتکل WARP مسدود است و سرور ضد فیلتر یافت نشد.")
                     }
@@ -218,6 +238,10 @@ class WarpService : Service() {
 
                 val cleanEndpoint = activeSuccessEndpoint
                 activeCleanEndpoint = cleanEndpoint
+                runCatching {
+                    preferencesManager.updateWarpCleanEndpoint("${cleanEndpoint.ip}:${cleanEndpoint.port}")
+                    preferencesManager.updateVpnProtocolProfile(profileKey, VpnProtocol.WARP.name)
+                }
 
                 // Step 5: Update UI & Status upon verified connectivity
                 val cfServer = VpnServer(
@@ -231,8 +255,8 @@ class WarpService : Service() {
                 VpnStateHolder.updateConnected(
                     server = cfServer,
                     clientIp = account.assignedIpv4,
-                    strategy = "Anycast Clean IP (${cleanEndpoint.ip}:${cleanEndpoint.port})",
-                    physicalNetworkLabel = "WARP WireGuard"
+                    strategy = "$profileKey • WARP Anycast (${cleanEndpoint.ip}:${cleanEndpoint.port})",
+                    physicalNetworkLabel = profileKey
                 )
 
                 updateNotification("WARP متصل شد • ${cleanEndpoint.ip}")
@@ -256,6 +280,7 @@ class WarpService : Service() {
             var lastTx = 0L
             var durationSec = 0L
             var lastTime = System.currentTimeMillis()
+            var stalledSeconds = 0
 
             while (isActive && isConnected) {
                 delay(1000)
@@ -265,14 +290,28 @@ class WarpService : Service() {
                     if (stats != null) {
                         val currentRx = stats.totalRx()
                         val currentTx = stats.totalTx()
+                        val deltaRx = currentRx - lastRx
+                        val deltaTx = currentTx - lastTx
                         val now = System.currentTimeMillis()
                         val elapsedSec = ((now - lastTime) / 1000.0).coerceAtLeast(1.0)
-                        val speedRx = (((currentRx - lastRx).toDouble() / elapsedSec).toLong()).coerceAtLeast(0L)
-                        val speedTx = (((currentTx - lastTx).toDouble() / elapsedSec).toLong()).coerceAtLeast(0L)
+                        val speedRx = ((deltaRx.toDouble() / elapsedSec).toLong()).coerceAtLeast(0L)
+                        val speedTx = ((deltaTx.toDouble() / elapsedSec).toLong()).coerceAtLeast(0L)
 
                         lastRx = currentRx
                         lastTx = currentTx
                         lastTime = now
+
+                        if (deltaTx > 1024L && deltaRx <= 0L) {
+                            stalledSeconds++
+                            if (stalledSeconds >= 14) {
+                                VpnStateHolder.log("WARP mid-session UDP stall detected; rescanning cleaner Cloudflare endpoint...")
+                                stalledSeconds = 0
+                                rescanAndReconnect()
+                                break
+                            }
+                        } else if (deltaRx > 0L) {
+                            stalledSeconds = 0
+                        }
 
                         VpnStateHolder.updateMetrics(
                             bytesIn = currentRx,
@@ -327,60 +366,74 @@ class WarpService : Service() {
     }
 
     private suspend fun verifyTunnelConnectivity(backendInstance: GoBackend): Boolean = withContext(Dispatchers.IO) {
-        val startTime = System.currentTimeMillis()
+        val resultChannel = kotlinx.coroutines.channels.Channel<Boolean>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         var rxSeen = false
+        var probeVerified = false
 
-        // Parallel probe: Telegram MTProto endpoints and Cloudflare HTTP
-        val probeJob = async {
+        coroutineScope {
             val tgEndpoints = listOf(
                 InetSocketAddress("149.154.167.50", 443),
                 InetSocketAddress("149.154.167.91", 443),
-                InetSocketAddress("149.154.167.92", 443),
                 InetSocketAddress("91.108.56.165", 443)
             )
-            for (ep in tgEndpoints) {
+            val probeJobs = tgEndpoints.map { ep ->
+                async {
+                    val ok = try {
+                        Socket().use { s ->
+                            s.connect(ep, 2200)
+                            true
+                        }
+                    } catch (_: Exception) {
+                        false
+                    }
+                    resultChannel.trySend(ok)
+                }
+            } + async {
+                val ok = try {
+                    val url = URL("http://cp.cloudflare.com/generate_204")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 2200
+                    conn.readTimeout = 2200
+                    conn.instanceFollowRedirects = false
+                    val code = conn.responseCode
+                    conn.disconnect()
+                    code in 200..399
+                } catch (_: Exception) {
+                    false
+                }
+                resultChannel.trySend(ok)
+            }
+
+            val totalProbes = probeJobs.size
+            var completedProbes = 0
+            val deadlineMs = System.currentTimeMillis() + 2600L
+
+            while (System.currentTimeMillis() < deadlineMs && completedProbes < totalProbes) {
+                while (true) {
+                    val r = resultChannel.tryReceive().getOrNull() ?: break
+                    completedProbes++
+                    if (r) {
+                        probeVerified = true
+                        break
+                    }
+                }
+                if (probeVerified) break
+
                 try {
-                    Socket().use { s ->
-                        s.connect(ep, 2000)
-                        return@async true
+                    val stats = backendInstance.getStatistics(warpTunnel)
+                    if (stats != null && stats.totalRx() > 0) {
+                        rxSeen = true
                     }
                 } catch (_: Exception) {}
+
+                delay(150)
             }
-            // Probe HTTP generate_204
-            try {
-                val url = URL("http://cp.cloudflare.com/generate_204")
-                val conn = url.openConnection() as HttpURLConnection
-                conn.connectTimeout = 2000
-                conn.readTimeout = 2000
-                conn.instanceFollowRedirects = false
-                val code = conn.responseCode
-                conn.disconnect()
-                if (code in 200..399) return@async true
-            } catch (_: Exception) {}
-            false
+
+            probeJobs.forEach { it.cancel() }
         }
 
-        // Wait up to 3.8s, checking backend statistics periodically
-        while (System.currentTimeMillis() - startTime < 3800L) {
-            delay(400)
-            try {
-                val stats = backendInstance.getStatistics(warpTunnel)
-                if (stats != null && stats.totalRx() > 0) {
-                    rxSeen = true
-                    break
-                }
-            } catch (_: Exception) {}
-            if (probeJob.isCompleted && probeJob.getCompleted()) {
-                return@withContext true
-            }
-        }
-
-        val probeResult = try {
-            withTimeoutOrNull(600) { probeJob.await() } ?: false
-        } catch (_: Exception) { false }
-
-        VpnStateHolder.log("WARP tunnel connectivity probe: RxSeen=$rxSeen, RealProbe=$probeResult")
-        return@withContext (rxSeen && probeResult) || probeResult
+        VpnStateHolder.log("WARP tunnel connectivity probe: RxSeen=$rxSeen, RealProbe=$probeVerified")
+        return@withContext probeVerified
     }
 
     private suspend fun teardownWireGuardSilently() {
@@ -494,13 +547,15 @@ class WarpService : Service() {
         const val ACTION_CONNECT = "com.aethervpn.client.WARP_CONNECT"
         const val ACTION_DISCONNECT = "com.aethervpn.client.WARP_DISCONNECT"
         const val ACTION_RESCAN = "com.aethervpn.client.WARP_RESCAN"
+        const val EXTRA_FROM_AUTO_SMART = "extra_from_auto_smart"
 
         private const val CHANNEL_ID = "radin_warp_channel"
         private const val NOTIFICATION_ID = 2001
 
-        fun buildConnectIntent(context: Context): Intent =
+        fun buildConnectIntent(context: Context, fromAutoSmart: Boolean = false): Intent =
             Intent(context, WarpService::class.java).apply {
                 action = ACTION_CONNECT
+                putExtra(EXTRA_FROM_AUTO_SMART, fromAutoSmart)
             }
 
         fun buildDisconnectIntent(context: Context): Intent =

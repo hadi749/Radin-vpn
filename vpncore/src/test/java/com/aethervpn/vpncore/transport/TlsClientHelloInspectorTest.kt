@@ -195,5 +195,29 @@ class TlsClientHelloInspectorTest {
         }
         assertArrayEquals(packet, rebuilt.toByteArray())
     }
+
+    @Test
+    fun adaptiveHybridSlicesIsolateRecordAndSniAndVaryBySeed() {
+        val host = "hybrid-desync.opengw.net"
+        val packet = buildSyntheticClientHello(host, paddingExtBytes = 84)
+        val sni = TlsClientHelloInspector.findSniRange(packet)!!
+
+        val slices0 = TlsClientHelloInspector.computeAdaptiveHybridSlices(packet, cutSeed = 0)
+        val slices20 = TlsClientHelloInspector.computeAdaptiveHybridSlices(packet, cutSeed = 20)
+        assertTrue(slices0.size >= 5)
+        // Reassembly for both seeds must match original ClientHello byte-for-byte
+        for (slices in listOf(slices0, slices20)) {
+            assertEquals(0..0, slices[0])
+            assertEquals(1..2, slices[1])
+            assertEquals(3..4, slices[2])
+            val rebuilt = ByteArrayOutputStream()
+            for (range in slices) {
+                rebuilt.write(packet, range.first, range.last - range.first + 1)
+            }
+            assertArrayEquals(packet, rebuilt.toByteArray())
+            assertTrue(slices.any { it.first in (sni.hostStart + 1) until sni.hostEnd })
+        }
+        assertTrue("Different cutSeeds should shift interior SNI split offset", slices0 != slices20)
+    }
 }
 

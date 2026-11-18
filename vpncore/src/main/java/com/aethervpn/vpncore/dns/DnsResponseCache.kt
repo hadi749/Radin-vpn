@@ -44,12 +44,27 @@ class DnsResponseCache(
     private var hitCount = 0L
     private var missCount = 0L
 
+    data class CacheLookupResult(
+        val wireResponse: ByteArray,
+        val isStale: Boolean
+    )
+
     fun get(queryPayload: ByteArray, routeBucket: Int): ByteArray? {
+        val res = getWithStale(queryPayload, routeBucket, maxStaleGraceMs = 0L) ?: return null
+        return if (res.isStale) null else res.wireResponse
+    }
+
+    fun getWithStale(
+        queryPayload: ByteArray,
+        routeBucket: Int,
+        maxStaleGraceMs: Long = 300_000L
+    ): CacheLookupResult? {
         if (queryPayload.size < 18) return null
         val qKey = TunnelPackets.extractDnsQueryKey(queryPayload) ?: return null
         val key = CacheKey(qKey, routeBucket)
         val now = clockMs()
 
+        var stale = false
         val cached = synchronized(lock) {
             val entry = entries[key]
             if (entry == null) {
@@ -57,9 +72,13 @@ class DnsResponseCache(
                 return null
             }
             if (now >= entry.expiresAtMs) {
-                entries.remove(key)
-                missCount++
-                return null
+                if (maxStaleGraceMs > 0L && now < entry.expiresAtMs + maxStaleGraceMs) {
+                    stale = true
+                } else {
+                    entries.remove(key)
+                    missCount++
+                    return null
+                }
             }
             hitCount++
             entry.wireResponse.clone()
@@ -68,7 +87,7 @@ class DnsResponseCache(
         // Rewrite transaction ID so the cached payload matches the caller's request
         cached[0] = queryPayload[0]
         cached[1] = queryPayload[1]
-        return cached
+        return CacheLookupResult(cached, stale)
     }
 
     fun put(queryPayload: ByteArray, responsePayload: ByteArray, routeBucket: Int) {

@@ -82,11 +82,6 @@ class MainViewModel @Inject constructor(
             VpnStateHolder.log(versionBanner)
         }
         viewModelScope.launch {
-            try {
-                if (preferencesManager.settingsFlow.first().vpnProtocol == VpnProtocol.WARP) {
-                    preferencesManager.updateVpnProtocol(VpnProtocol.SSTP)
-                }
-            } catch (_: Exception) {}
             serverRepository.ensureInitialized()
             launch {
                 servers.collect { list ->
@@ -147,8 +142,17 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    private fun resolveLearnedProtocolForCurrentNetwork(): String? {
+        val currentSettings = settings.value
+        if (currentSettings.vpnProtocol != VpnProtocol.AUTO_SMART) return null
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val profileKey = VpnStateHolder.resolveNetworkProfileKey(cm, null, context)
+        return currentSettings.vpnProtocolProfiles[profileKey]
+    }
+
     fun connectSelectedServer() {
-        if (settings.value.vpnProtocol == VpnProtocol.WARP) {
+        val proto = settings.value.vpnProtocol
+        if (proto == VpnProtocol.WARP || resolveLearnedProtocolForCurrentNetwork() == VpnProtocol.WARP.name) {
             connectWarp()
             return
         }
@@ -198,7 +202,8 @@ class MainViewModel @Inject constructor(
     }
 
     fun quickConnect() {
-        if (settings.value.vpnProtocol == VpnProtocol.WARP) {
+        val proto = settings.value.vpnProtocol
+        if (proto == VpnProtocol.WARP || resolveLearnedProtocolForCurrentNetwork() == VpnProtocol.WARP.name) {
             connectWarp()
             return
         }
@@ -229,7 +234,8 @@ class MainViewModel @Inject constructor(
     }
 
     fun switchToAnotherServer() {
-        if (settings.value.vpnProtocol == VpnProtocol.WARP) {
+        val isWarpActive = vpnState.value.currentServer?.countryShort == "CF"
+        if (settings.value.vpnProtocol == VpnProtocol.WARP || isWarpActive) {
             rescanWarpCleanIp()
             return
         }
@@ -456,7 +462,7 @@ class MainViewModel @Inject constructor(
                 }
 
                 val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-                val profileKey = VpnStateHolder.resolveNetworkProfileKey(cm)
+                val profileKey = VpnStateHolder.resolveNetworkProfileKey(cm, null, context)
                 val preferred = currentSettings.vpnBypassProfiles[profileKey]
                     ?.let { key -> SniStrategy.entries.firstOrNull { it.name == key && it.isConcreteTransport } }
                 val customSniOverride = target.customSni?.takeIf { it.isNotBlank() }

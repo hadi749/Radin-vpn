@@ -17,6 +17,17 @@ interface TunnelClient {
     fun setProbeInterceptor(interceptor: ((ByteArray) -> Boolean)?)
 
     /**
+     * Zero-allocation variant of [setProbeInterceptor] passing buffer, offset, and length directly.
+     */
+    fun setPacketProbeInterceptor(interceptor: ((ByteArray, Int, Int) -> Boolean)?) {
+        if (interceptor == null) {
+            setProbeInterceptor(null)
+        } else {
+            setProbeInterceptor { bytes -> interceptor(bytes, 0, bytes.size) }
+        }
+    }
+
+    /**
      * Retrieve a point-in-time snapshot of tunnel packet counters and timestamps.
      */
     fun snapshotTraffic(): SstpTrafficSnapshot

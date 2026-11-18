@@ -356,6 +356,58 @@ object TlsClientHelloInspector {
         return out
     }
 
+    /**
+     * Adaptive hybrid desync segmentation: combines 1-byte TLS ContentType isolation (`0x16`),
+     * record header boundary split, pre-SNI cut, and seed-varied interior SNI cuts so stateful
+     * DPI systems cannot fingerprint a fixed split offset.
+     */
+    fun computeAdaptiveHybridSlices(
+        packet: ByteArray,
+        offset: Int = 0,
+        length: Int = packet.size,
+        cutSeed: Int = 0
+    ): List<IntRange> {
+        if (length <= 5 || offset < 0 || offset + length > packet.size) {
+            return if (length > 0) listOf(0 until length) else emptyList()
+        }
+        val cuts = sortedSetOf<Int>()
+        cuts.add(1)
+        cuts.add(3)
+        cuts.add(5)
+
+        val sni = findSniRange(packet, offset, length)
+        if (sni != null && sni.hostLength >= 3) {
+            val hostRelStart = (sni.hostStart - offset).coerceIn(6, length - 2)
+            val hostRelEnd = (sni.hostEnd - offset).coerceIn(hostRelStart + 2, length)
+            val span = (hostRelEnd - hostRelStart).coerceAtLeast(2)
+            val preSni = (hostRelStart - 1).coerceIn(6, length - 1)
+            // Vary the interior cut across 25%..75% of the SNI hostname based on cutSeed
+            val pct = 25 + ((cutSeed and 0x7FFFFFFF) % 50)
+            val cutA = (hostRelStart + ((span * pct) / 100)).coerceIn(hostRelStart + 1, hostRelEnd - 1)
+            val cutB = (cutA + maxOf(2, span / 3)).coerceIn(cutA + 1, hostRelEnd)
+            cuts.add(preSni)
+            cuts.add(cutA)
+            if (cutB < length) cuts.add(cutB)
+            if (hostRelEnd < length) cuts.add(hostRelEnd)
+        } else if (length > 24) {
+            val mid = (length / 3 + ((cutSeed and 0x7FFFFFFF) % maxOf(2, length / 4))).coerceIn(6, length - 1)
+            cuts.add(mid)
+        }
+
+        val out = ArrayList<IntRange>(cuts.size + 1)
+        var start = 0
+        for (cut in cuts) {
+            if (cut in (start + 1) until length) {
+                out.add(start until cut)
+                start = cut
+            }
+        }
+        if (start < length) {
+            out.add(start until length)
+        }
+        return out
+    }
+
     private fun buildTlsRecord(
         verMajor: Byte,
         verMinor: Byte,

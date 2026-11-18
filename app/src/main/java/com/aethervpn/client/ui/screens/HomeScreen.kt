@@ -552,16 +552,17 @@ fun HomeScreen(
                     .padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val showWarpCard = vpnProtocol == VpnProtocol.WARP || (isConnected && displayServer?.countryShort == "CF")
                 Icon(
                     imageVector = Icons.Default.Public,
                     contentDescription = "Server",
-                    tint = if (vpnProtocol == VpnProtocol.WARP) AccentAmber else MaterialTheme.colorScheme.primary,
+                    tint = if (showWarpCard) AccentAmber else MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(36.dp)
                 )
                 Spacer(modifier = Modifier.width(16.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (vpnProtocol == VpnProtocol.WARP) {
+                        text = if (showWarpCard) {
                             "Cloudflare WARP (سریع و نامحدود)"
                         } else {
                             displayServer?.countryLong?.ifBlank { displayServer.hostName } ?: stringResource(R.string.select_server)
@@ -570,14 +571,19 @@ fun HomeScreen(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = if (vpnProtocol == VpnProtocol.WARP) {
+                        text = if (showWarpCard) {
                             if (isConnected && displayServer != null) {
                                 "Anycast Clean IP: ${displayServer.ip}:${displayServer.customPort}"
                             } else {
                                 "اسکنر خودکار آی‌پی تمیز کلودفلر (Anti-DPI)"
                             }
                         } else if (displayServer != null) {
-                            val protoTag = if (vpnProtocol == VpnProtocol.SOFTETHER_NATIVE) " • SoftEther Multi-TCP" else " • SSTP"
+                            val protoTag = when (vpnProtocol) {
+                                VpnProtocol.AUTO_SMART -> " • Auto Smart (Multi-TCP / SSTP / WARP)"
+                                VpnProtocol.SOFTETHER_NATIVE -> " • SoftEther Multi-TCP"
+                                VpnProtocol.SSTP -> " • SSTP"
+                                VpnProtocol.WARP -> " • WARP"
+                            }
                             "${displayServer.hostName} (${displayServer.ip}:${displayServer.customPort})$protoTag"
                         } else {
                             "Tap to choose a VPN server"

@@ -378,6 +378,7 @@ class ServerRepository @Inject constructor(
             return null
         }
         val probeStrategies = listOf(
+            SniStrategy.ADAPTIVE_HYBRID_DESYNC to 1,
             SniStrategy.ZAPRET_SPLIT1_DESYNC to 1,
             SniStrategy.TLS_HEADER_DESYNC to 2,
             SniStrategy.MULTI_CHUNK_FRAGMENTATION to 16,
@@ -418,9 +419,8 @@ class ServerRepository @Inject constructor(
                         return server.copy(ping = rttMs)
                     }
                 }
-                return null
             } catch (_: Exception) {
-                // Retry with TCP fragmentation if DPI reset the direct TLS probe
+                // Retry with next desync/fragmentation strategy if DPI reset or injected block page
             } finally {
                 try { transport?.close() } catch (_: Exception) {}
             }
@@ -838,6 +838,7 @@ class ServerRepository @Inject constructor(
         }
 
         internal val DEFAULT_MIRROR_BYPASS_CANDIDATES = listOf(
+            MirrorBypassCandidate("ADAPTIVE_HYBRID_DESYNC:1", SniStrategy.ADAPTIVE_HYBRID_DESYNC, 1),
             MirrorBypassCandidate("ZAPRET_SPLIT1_DESYNC:1", SniStrategy.ZAPRET_SPLIT1_DESYNC, 1),
             MirrorBypassCandidate("TLS_HEADER_DESYNC:2", SniStrategy.TLS_HEADER_DESYNC, 2),
             MirrorBypassCandidate("MULTI_CHUNK_FRAGMENTATION:16", SniStrategy.MULTI_CHUNK_FRAGMENTATION, 16),

@@ -1,8 +1,10 @@
 package com.aethervpn.client.service
 
+import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.telephony.TelephonyManager
 import com.aethervpn.client.data.model.VpnServer
 import com.aethervpn.vpncore.transport.CensorshipDiagnosis
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -245,7 +247,8 @@ object VpnStateHolder {
 
     fun resolveNetworkProfileKey(
         cm: ConnectivityManager?,
-        preferredNetwork: Network? = null
+        preferredNetwork: Network? = null,
+        context: Context? = null
     ): String {
         if (cm == null) return "DEFAULT"
         val network = preferredNetwork ?: cm.activeNetwork
@@ -255,10 +258,50 @@ object VpnStateHolder {
             null
         } ?: return "DEFAULT"
         return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                val fp = buildLinkFingerprint(cm, network)
+                if (fp.isNotEmpty()) "WIFI_$fp" else "WIFI"
+            }
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                val carrier = resolveSanitizedCarrierToken(context)
+                if (carrier.isNotEmpty()) "CELLULAR_$carrier" else "CELLULAR"
+            }
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> {
+                val fp = buildLinkFingerprint(cm, network)
+                if (fp.isNotEmpty()) "ETHERNET_$fp" else "ETHERNET"
+            }
             else -> "OTHER"
+        }
+    }
+
+    private fun resolveSanitizedCarrierToken(context: Context?): String {
+        if (context == null) return ""
+        return try {
+            val tm = context.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager ?: return ""
+            val raw = tm.networkOperator.takeIf { !it.isNullOrBlank() }
+                ?: tm.networkOperatorName.orEmpty()
+            raw.replace(Regex("[^A-Za-z0-9]"), "")
+                .uppercase(Locale.US)
+                .take(12)
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun buildLinkFingerprint(cm: ConnectivityManager, network: Network?): String {
+        if (network == null) return ""
+        return try {
+            val lp = cm.getLinkProperties(network) ?: return ""
+            val dnsSig = lp.dnsServers
+                .mapNotNull { it.hostAddress }
+                .sorted()
+                .joinToString(",")
+            val raw = "${lp.interfaceName.orEmpty()}|$dnsSig"
+            if (raw == "|") return ""
+            val code = raw.hashCode() and 0xFFFFFF
+            code.toString(16).uppercase(Locale.US).padStart(6, '0')
+        } catch (_: Exception) {
+            ""
         }
     }
 

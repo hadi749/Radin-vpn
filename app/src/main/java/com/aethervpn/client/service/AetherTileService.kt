@@ -1,7 +1,9 @@
 package com.aethervpn.client.service
 
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
@@ -54,7 +56,14 @@ class AetherTileService : TileService() {
             CoroutineScope(Dispatchers.IO).launch {
                 val pref = PreferencesManager(applicationContext)
                 val settings = pref.settingsFlow.first()
-                if (settings.vpnProtocol == VpnProtocol.WARP) {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val profileKey = VpnStateHolder.resolveNetworkProfileKey(cm, null, applicationContext)
+                val learnedProto = if (settings.vpnProtocol == VpnProtocol.AUTO_SMART) {
+                    settings.vpnProtocolProfiles[profileKey]
+                } else {
+                    null
+                }
+                if (settings.vpnProtocol == VpnProtocol.WARP || learnedProto == VpnProtocol.WARP.name) {
                     ContextCompat.startForegroundService(
                         applicationContext,
                         WarpService.buildConnectIntent(applicationContext)
