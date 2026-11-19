@@ -24,7 +24,8 @@ class SniBypassSocketFactory(
     private val socketProtector: SocketProtector? = null,
     private val onCertificateCaptured: ((X509Certificate) -> Unit)? = null,
     private val onSocketCreated: ((Socket) -> Unit)? = null,
-    private val decoySeed: Int = 0
+    private val decoySeed: Int = 0,
+    private val allowHttp2Alpn: Boolean = false
 ) {
 
     private val trustManager = object : X509TrustManager {
@@ -63,6 +64,9 @@ class SniBypassSocketFactory(
         if (eff == SniStrategy.DIRECT_IP_NO_SNI) {
             return null
         }
+        if (eff == SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT) {
+            return if (!customSni.isNullOrBlank()) customSni else SniStrategy.pickIranWhitelistSni(decoySeed)
+        }
         if (!customSni.isNullOrBlank()) {
             return customSni
         }
@@ -92,7 +96,8 @@ class SniBypassSocketFactory(
         val eff = effectiveStrategy()
         val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC ||
             eff == SniStrategy.ZAPRET_SPLIT1_DESYNC ||
-            eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC
+            eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC ||
+            eff == SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT
         val rawSocket = openProtectedTcpSocket(
             ipAddress = ipAddress,
             port = port,
@@ -123,7 +128,7 @@ class SniBypassSocketFactory(
             SniStrategy.DECOY_SNI_FRAGMENT -> ClientHelloTransformSocket(
                 delegate = rawSocket,
                 tcpChunkSize = 36,
-                tcpDelayMs = minOf(splitDelayMs, 4L).coerceAtLeast(2L),
+                tcpDelayMs = minOf(splitDelayMs, 6L).coerceAtLeast(3L),
                 splitTlsRecords = true,
                 maxTlsRecordPayload = 64,
                 surgicalSniRecordSplit = true,
@@ -132,7 +137,7 @@ class SniBypassSocketFactory(
             SniStrategy.TLS_HEADER_DESYNC -> ClientHelloTransformSocket(
                 delegate = rawSocket,
                 tcpChunkSize = 24,
-                tcpDelayMs = minOf(splitDelayMs, 4L).coerceAtLeast(2L),
+                tcpDelayMs = minOf(splitDelayMs, 6L).coerceAtLeast(3L),
                 splitTlsRecords = false,
                 useSniAwareTcpSlices = false,
                 headerDesync = true
@@ -140,7 +145,7 @@ class SniBypassSocketFactory(
             SniStrategy.WINDOW_ALPN_MICRO_DESYNC -> ClientHelloTransformSocket(
                 delegate = rawSocket,
                 tcpChunkSize = 24,
-                tcpDelayMs = 2L,
+                tcpDelayMs = 3L,
                 splitTlsRecords = false,
                 useSniAwareTcpSlices = false,
                 microDesync = true,
@@ -149,7 +154,7 @@ class SniBypassSocketFactory(
             SniStrategy.ZAPRET_SPLIT1_DESYNC -> ClientHelloTransformSocket(
                 delegate = rawSocket,
                 tcpChunkSize = 24,
-                tcpDelayMs = 3L,
+                tcpDelayMs = 4L,
                 splitTlsRecords = false,
                 useSniAwareTcpSlices = false,
                 zapretSplit1 = true,
@@ -158,12 +163,26 @@ class SniBypassSocketFactory(
             SniStrategy.ADAPTIVE_HYBRID_DESYNC -> ClientHelloTransformSocket(
                 delegate = rawSocket,
                 tcpChunkSize = 24,
-                tcpDelayMs = (2L + ((decoySeed and 0x7FFFFFFF) % 3L)),
-                splitTlsRecords = false,
+                tcpDelayMs = (4L + ((decoySeed and 0x7FFFFFFF) % 5L)),
+                splitTlsRecords = true,
+                maxTlsRecordPayload = 48,
+                surgicalSniRecordSplit = true,
                 useSniAwareTcpSlices = false,
                 adaptiveHybrid = true,
                 adaptiveSeed = decoySeed,
-                headerStallMs = (18L + ((decoySeed and 0x7FFFFFFF) % 10L))
+                headerStallMs = (14L + ((decoySeed and 0x7FFFFFFF) % 10L))
+            )
+            SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT -> ClientHelloTransformSocket(
+                delegate = rawSocket,
+                tcpChunkSize = 20,
+                tcpDelayMs = (5L + ((decoySeed and 0x7FFFFFFF) % 6L)),
+                splitTlsRecords = true,
+                maxTlsRecordPayload = 40,
+                surgicalSniRecordSplit = true,
+                useSniAwareTcpSlices = true,
+                adaptiveHybrid = true,
+                adaptiveSeed = decoySeed + 7,
+                headerStallMs = 16L
             )
             else -> rawSocket
         }
@@ -192,7 +211,8 @@ class SniBypassSocketFactory(
             }
             val isWindowMicro = eff == SniStrategy.WINDOW_ALPN_MICRO_DESYNC ||
                 eff == SniStrategy.ZAPRET_SPLIT1_DESYNC ||
-                eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC
+                eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC ||
+                eff == SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT
             val isBrowserMimic = isWindowMicro ||
                 eff == SniStrategy.TLS_HEADER_DESYNC ||
                 eff == SniStrategy.DECOY_SNI_FRAGMENT ||
@@ -207,12 +227,9 @@ class SniBypassSocketFactory(
             if (isBrowserMimic) {
                 params.useCipherSuitesOrder = true
                 // Guard ALPN reflection-style so both JVM 17+ and Android API 24..28 run cleanly without NewApi issues.
+                // Never advertise h2 unless the caller actually speaks HTTP/2 (raw HTTP/1.1 callers fail if server selects h2).
                 runCatching {
-                    val alpn = if (eff == SniStrategy.ADAPTIVE_HYBRID_DESYNC || eff == SniStrategy.DECOY_SNI_FRAGMENT) {
-                        arrayOf("h2", "http/1.1")
-                    } else {
-                        arrayOf("http/1.1")
-                    }
+                    val alpn = if (allowHttp2Alpn) arrayOf("h2", "http/1.1") else arrayOf("http/1.1")
                     params.javaClass
                         .getMethod("setApplicationProtocols", Array<String>::class.java)
                         .invoke(params, alpn)
@@ -253,7 +270,6 @@ class SniBypassSocketFactory(
         port: Int,
         timeoutMs: Int = 10000
     ): SstpTransport {
-        val wrappedSocket = openWrappedSocket(ipAddress, port, timeoutMs)
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf<TrustManager>(trustManager), null)
 
@@ -274,6 +290,7 @@ class SniBypassSocketFactory(
             supportedProtocols = engine.supportedProtocols
         )
 
+        val wrappedSocket = openWrappedSocket(ipAddress, port, timeoutMs)
         val transport = SslEngineTransport(wrappedSocket, engine)
         transport.doHandshake()
         return transport

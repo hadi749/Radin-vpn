@@ -17,33 +17,79 @@ data class CleanEndpoint(
 
 object CloudflareCleanIpScanner {
 
-    // Curated high-yield Anycast prefixes known to work across restricted cellular/fixed networks
+    // Curated Cloudflare WARP WireGuard Anycast prefixes (162.159.192.0/22 & 188.114.96.0/22)
+    // verified to serve WARP UDP across diverse Iranian ISPs (MCI, Irancell, Rightel, TCI, Shatel).
     val CANDIDATE_IPS = listOf(
-        // 188.114.96.0/24 - 188.114.99.0/24
-        "188.114.97.1", "188.114.96.1", "188.114.98.1", "188.114.99.1",
-        "188.114.97.2", "188.114.96.2", "188.114.98.2", "188.114.99.2",
-        "188.114.97.10", "188.114.96.10", "188.114.98.10", "188.114.99.10",
-        "188.114.97.66", "188.114.98.66", "188.114.96.66", "188.114.99.66",
-        "188.114.97.120", "188.114.98.120", "188.114.96.120", "188.114.99.120",
-        "188.114.97.150", "188.114.98.150", "188.114.96.150", "188.114.99.150",
-        "188.114.97.200", "188.114.98.200", "188.114.96.200", "188.114.99.200",
-        // 162.159.192.0/24 - 162.159.195.0/24 (Cloudflare WARP / Engage endpoints)
-        "162.159.192.1", "162.159.193.1", "162.159.195.1",
-        "162.159.192.2", "162.159.193.2", "162.159.195.2",
-        "162.159.192.10", "162.159.193.10", "162.159.195.10",
-        "162.159.192.66", "162.159.193.66", "162.159.195.66",
-        "162.159.192.120", "162.159.193.120", "162.159.195.120",
-        "162.159.192.150", "162.159.193.150", "162.159.195.150",
-        "162.159.192.200", "162.159.193.200", "162.159.195.200",
-        // 172.64.0.0/16 Anycast nodes
-        "172.64.155.1", "172.64.156.1", "172.64.157.1", "172.64.158.1",
-        "172.64.155.2", "172.64.156.2", "172.64.157.2", "172.64.158.2",
-        // 104.16.0.0 - 104.28.0.0 edge
-        "104.16.132.229", "104.16.133.229", "104.19.154.25", "104.20.154.25"
+        // 162.159.192.0/24 - 162.159.195.0/24 (Primary WARP Engage Anycast)
+        "162.159.192.1", "162.159.192.2", "162.159.192.3", "162.159.192.10",
+        "162.159.192.66", "162.159.192.120", "162.159.192.150", "162.159.192.200",
+        "162.159.193.1", "162.159.193.2", "162.159.193.5", "162.159.193.10",
+        "162.159.193.66", "162.159.193.120", "162.159.193.150", "162.159.193.200",
+        "162.159.195.1", "162.159.195.2", "162.159.195.10", "162.159.195.66",
+        "162.159.195.120", "162.159.195.150", "162.159.195.200",
+        // 188.114.96.0/24 - 188.114.99.0/24 (European/ME Anycast Edge)
+        "188.114.96.1", "188.114.96.2", "188.114.96.10", "188.114.96.66",
+        "188.114.96.120", "188.114.96.150", "188.114.96.200",
+        "188.114.97.1", "188.114.97.2", "188.114.97.10", "188.114.97.66",
+        "188.114.97.120", "188.114.97.150", "188.114.97.200",
+        "188.114.98.1", "188.114.98.2", "188.114.98.10", "188.114.98.66",
+        "188.114.98.120", "188.114.98.150", "188.114.98.200",
+        "188.114.99.1", "188.114.99.2", "188.114.99.10", "188.114.99.66",
+        "188.114.99.120", "188.114.99.150", "188.114.99.200"
     )
 
-    // Curated WARP WireGuard UDP & mimicry ports
-    val CANDIDATE_PORTS = listOf(2408, 500, 1701, 4500, 443, 854, 880, 989, 990, 8080)
+    // Full list of official Cloudflare WARP WireGuard listening UDP ports (bypasses port-2408 blocks)
+    val CANDIDATE_PORTS = listOf(
+        2408, 500, 1701, 4500, 854, 859, 864, 878, 880, 890, 891, 894,
+        903, 908, 928, 934, 939, 942, 943, 945, 946, 955, 968, 987, 988,
+        1002, 1010, 1014, 1018, 1070, 1074, 1180, 1387, 1843, 2371, 2506,
+        3138, 3476, 3581, 3854, 4177, 4198, 4233, 5279, 5956, 7103, 7152,
+        7156, 7281, 7559, 8319, 8742, 8854, 8886
+    )
+
+    /**
+     * Builds a maximally diverse list of Cloudflare Anycast (IP, UDP Port) pairs spanning
+     * all 7 WARP /24 subnets and non-standard UDP ports for instant parallel real-UDP
+     * WireGuard handshake racing (no slow TCP:443 pre-scan needed).
+     */
+    fun buildDiverseUdpCandidates(
+        preferredEndpoint: CleanEndpoint? = null,
+        targetPort: Int = 2408,
+        count: Int = 18
+    ): List<CleanEndpoint> {
+        val result = LinkedHashMap<String, CleanEndpoint>(count)
+        if (preferredEndpoint != null && preferredEndpoint.ip.isNotBlank() && preferredEndpoint.port in 1..65535) {
+            result["${preferredEndpoint.ip}:${preferredEndpoint.port}"] = preferredEndpoint
+        }
+
+        // Group candidate IPs by /24 subnet and shuffle within each subnet for breadth
+        val subnetGroups = CANDIDATE_IPS
+            .groupBy { ip -> ip.substringBeforeLast('.') }
+            .values
+            .map { it.shuffled() }
+            .shuffled()
+
+        // Prioritize a blend of high-success non-standard ports + classic ports
+        val prioritizedPorts = buildList {
+            if (targetPort in CANDIDATE_PORTS) add(targetPort)
+            addAll(listOf(854, 878, 880, 908, 987, 1018, 1701, 2371, 4500, 500, 4198, 7156, 8854, 8886, 2408))
+            addAll(CANDIDATE_PORTS.shuffled())
+        }.distinct()
+
+        var round = 0
+        var portCursor = 0
+        while (result.size < count && round < 8) {
+            for (group in subnetGroups) {
+                if (result.size >= count) break
+                val ip = group.getOrNull(round) ?: continue
+                val port = prioritizedPorts[portCursor % prioritizedPorts.size]
+                portCursor++
+                result.putIfAbsent("$ip:$port", CleanEndpoint(ip = ip, port = port, pingMs = 0L))
+            }
+            round++
+        }
+        return result.values.toList()
+    }
 
     suspend fun findBestCleanEndpoint(
         targetPort: Int = 2408,
@@ -85,11 +131,11 @@ object CloudflareCleanIpScanner {
 
         val portPool = listOf(
             targetPort,
-            if (targetPort != 500) 500 else 1701,
-            if (targetPort != 1701) 1701 else 2408,
-            if (targetPort != 4500) 4500 else 854,
-            if (targetPort != 443) 443 else 880,
-            854
+            if (targetPort != 854) 854 else 878,
+            if (targetPort != 1701) 1701 else 987,
+            if (targetPort != 4500) 4500 else 2371,
+            if (targetPort != 500) 500 else 8854,
+            7156
         )
 
         validScored.take(maxResults).mapIndexed { idx, res ->

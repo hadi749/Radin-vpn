@@ -525,11 +525,17 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
         var recoveringSameLinkSwitch = false
         var directAttemptedOnCurrentLink = false
 
+        val effectiveMaxFailures = if (effectiveProtocol == VpnProtocol.AUTO_SMART && !fromAutoSmart && !initialServer.isCustom) {
+            minOf(MAX_FAILOVER_ATTEMPTS, 4)
+        } else {
+            MAX_FAILOVER_ATTEMPTS
+        }
+
         while (currentCoroutineContext().isActive &&
             isRunning.get() &&
             !userStopRequested.get() &&
             activeGeneration == generation &&
-            consecutiveFailures < MAX_FAILOVER_ATTEMPTS
+            consecutiveFailures < effectiveMaxFailures
         ) {
             totalAttempts++
             resetAttemptFlags()
@@ -1077,7 +1083,6 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     private fun resolveEffectiveCustomSni(candidate: VpnServer, settings: UserSettings): String? {
         return candidate.customSni?.takeIf { it.isNotBlank() }
             ?: settings.customSni.takeIf { it.isNotBlank() }
-            ?: SniStrategy.DEFAULT_DECOY_SNIS.first()
     }
 
     private suspend fun resolveStrategiesForCandidate(
@@ -1268,22 +1273,18 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
 
     private fun isNonTransportFailure(msg: String?): Boolean {
         if (msg.isNullOrBlank()) return false
+        // Only classify post-TLS protocol/auth/TUN rejections as non-transport failures.
+        // TCP RST, ECONNRESET, timeouts, and ECONNREFUSED are classic Iran DPI signatures and
+        // MUST trigger CensorshipDetector + TLS record fragmentation / SNI bypass instead of aborting.
         return msg.contains("SSTP HTTP handshake failed") ||
             msg.contains("MS-CHAPv2 authentication rejected") ||
             msg.contains("Expected SSTP CALL_CONNECT_ACK") ||
+            msg.contains("SoftEther login failed") ||
             msg.contains("during LCP negotiation") ||
             msg.contains("during MS-CHAPv2 authentication") ||
             msg.contains("during IPCP negotiation") ||
             msg.contains("Cannot set address") ||
             msg.contains("Cannot establish TUN interface") ||
-            msg.contains("failed to connect to") ||
-            msg.contains("Connection refused") ||
-            msg.contains("ECONNREFUSED") ||
-            msg.contains("ENETUNREACH") ||
-            msg.contains("EHOSTUNREACH") ||
-            msg.contains("timed out") ||
-            msg.contains("Connection reset") ||
-            msg.contains("ECONNRESET") ||
             msg.contains("Server rejected IP address") ||
             msg.contains("no DHCP") ||
             msg.contains("LCP Terminate-Request")
@@ -1915,7 +1916,7 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
             // Add fast, public DNS first (e.g. Cloudflare / Google / user preset) so apps (like Telegram)
             // don't stall on unhandled private SoftEther 10.x.x.x hub addresses.
             val selectedPreset = DnsResolver.findById(settings.selectedDnsId)
-            if (selectedPreset != null && selectedPreset.ip.isNotBlank() && TunnelPackets.isPublicRoutableIpv4(selectedPreset.ip)) {
+            if (selectedPreset.ip.isNotBlank() && TunnelPackets.isPublicRoutableIpv4(selectedPreset.ip)) {
                 dnsServers.add(selectedPreset.ip)
             }
 
@@ -2284,7 +2285,10 @@ class AetherVpnService : VpnService(), SstpEventListener, SocketProtector {
     }
 
     override fun onDataPacketReceived(packet: ByteArray, offset: Int, length: Int) {
-        // Fast-path: Incoming packets from the server are written directly to TUN without redundant MSS clamp overhead
+        // Clamp incoming TCP SYN-ACK MSS (fast O(1) no-op on non-SYN data packets) to prevent
+        // remote servers from sending oversized segments that trigger PMTUD blackholes on cellular/PPPoE.
+        val maxMss = maxOf(536, activeMtu - 40)
+        MssClamper.clampMss(packet, offset, length, maxMss)
         writePacketToTun(packet, offset, length)
     }
 

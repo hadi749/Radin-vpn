@@ -13,10 +13,11 @@ object WarpConfigBuilder {
         account: WarpAccount,
         endpoint: CleanEndpoint,
         mtu: Int = 1280,
-        keepaliveSec: Int = 25,
+        keepaliveSec: Int = 15,
         excludeLan: Boolean = true,
         excludedApps: Collection<String> = emptyList(),
-        includedApps: Collection<String> = emptyList()
+        includedApps: Collection<String> = emptyList(),
+        excludeAppPackage: String? = null
     ): Config {
         val ifaceBuilder = Interface.Builder()
             .parsePrivateKey(account.privateKey)
@@ -25,11 +26,22 @@ object WarpConfigBuilder {
             .addDnsServer(InetAddress.getByName("1.0.0.1"))
             .setMtu(if (mtu in 1200..1500) mtu else 1280)
 
-        if (excludedApps.isNotEmpty()) {
-            ifaceBuilder.excludeApplications(excludedApps)
+        val effectiveIncluded = if (!excludeAppPackage.isNullOrBlank() && includedApps.isNotEmpty()) {
+            includedApps.filterNot { it == excludeAppPackage }
+        } else {
+            includedApps
         }
-        if (includedApps.isNotEmpty()) {
-            ifaceBuilder.includeApplications(includedApps)
+        val effectiveExcluded = if (!excludeAppPackage.isNullOrBlank() && effectiveIncluded.isEmpty()) {
+            (excludedApps + excludeAppPackage).distinct()
+        } else {
+            excludedApps
+        }
+
+        if (effectiveExcluded.isNotEmpty()) {
+            ifaceBuilder.excludeApplications(effectiveExcluded)
+        }
+        if (effectiveIncluded.isNotEmpty()) {
+            ifaceBuilder.includeApplications(effectiveIncluded)
         }
 
         account.assignedIpv6?.let { v6 ->

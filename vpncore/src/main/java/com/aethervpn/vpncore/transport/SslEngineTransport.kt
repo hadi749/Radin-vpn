@@ -55,9 +55,12 @@ class SslEngineTransport(
                     }
                     netOutBuffer.flip()
                     if (netOutBuffer.hasRemaining()) {
-                        val bytes = ByteArray(netOutBuffer.remaining())
-                        netOutBuffer.get(bytes)
-                        rawOut.write(bytes)
+                        rawOut.write(
+                            netOutBuffer.array(),
+                            netOutBuffer.arrayOffset() + netOutBuffer.position(),
+                            netOutBuffer.remaining()
+                        )
+                        netOutBuffer.position(netOutBuffer.limit())
                         rawOut.flush()
                     }
                     if (res.handshakeStatus == SSLEngineResult.HandshakeStatus.FINISHED) {
@@ -225,9 +228,12 @@ class SslEngineTransport(
                     }
                     netOutBuffer.flip()
                     if (netOutBuffer.hasRemaining()) {
-                        val outBytes = ByteArray(netOutBuffer.remaining())
-                        netOutBuffer.get(outBytes)
-                        rawOut.write(outBytes)
+                        rawOut.write(
+                            netOutBuffer.array(),
+                            netOutBuffer.arrayOffset() + netOutBuffer.position(),
+                            netOutBuffer.remaining()
+                        )
+                        netOutBuffer.position(netOutBuffer.limit())
                     }
                 }
                 rawOut.flush()

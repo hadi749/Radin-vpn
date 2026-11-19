@@ -31,6 +31,8 @@ object WarpRegistrar {
         byteArrayOf(162.toByte(), 159.toByte(), 192.toByte(), 1),
         byteArrayOf(188.toByte(), 114.toByte(), 97.toByte(), 1),
         byteArrayOf(162.toByte(), 159.toByte(), 193.toByte(), 1),
+        byteArrayOf(188.toByte(), 114.toByte(), 96.toByte(), 1),
+        byteArrayOf(162.toByte(), 159.toByte(), 195.toByte(), 1),
         byteArrayOf(188.toByte(), 114.toByte(), 98.toByte(), 1)
     )
 
@@ -104,9 +106,10 @@ object WarpRegistrar {
             }
         } catch (directError: Exception) {
             if (existingClient != null) throw directError
-            // Direct TLS/SNI failed (common under DPI). Escalate to SNI-desync over Cloudflare Anycast IPs.
+            // Direct TLS/SNI failed (common under DPI). Escalate to multi-record TLS fragmentation over Anycast IPs.
             val bypassStrategies = listOf(
                 SniStrategy.ADAPTIVE_HYBRID_DESYNC,
+                SniStrategy.TLS_RECORD_FRAGMENTATION,
                 SniStrategy.ZAPRET_SPLIT1_DESYNC,
                 SniStrategy.TLS_HEADER_DESYNC
             )
@@ -145,8 +148,10 @@ object WarpRegistrar {
 
         var assignedIpv4 = "172.16.0.2"
         var assignedIpv6: String? = null
+        var clientId: String? = null
         if (root.has("config")) {
             val configObj = root.getJSONObject("config")
+            clientId = configObj.optString("client_id").takeIf { !it.isNullOrBlank() }
             if (configObj.has("interface")) {
                 val ifaceObj = configObj.getJSONObject("interface")
                 if (ifaceObj.has("addresses")) {
@@ -201,7 +206,8 @@ object WarpRegistrar {
             assignedIpv4 = assignedIpv4,
             assignedIpv6 = assignedIpv6,
             license = license,
-            isWarpPlus = isWarpPlus
+            isWarpPlus = isWarpPlus,
+            clientId = clientId
         )
     }
 
@@ -220,7 +226,8 @@ object WarpRegistrar {
             strategy = strategy,
             strictCert = true,
             socketProtector = socketProtector,
-            decoySeed = decoySeed
+            decoySeed = decoySeed,
+            allowHttp2Alpn = false
         )
         val transport = factory.createAndConnectTransport(
             host = API_HOST,

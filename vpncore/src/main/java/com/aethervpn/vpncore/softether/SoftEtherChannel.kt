@@ -116,10 +116,13 @@ class SoftEtherChannel(
 
     fun isHealthy(nowMs: Long = System.currentTimeMillis()): Boolean {
         if (!isConnected.get()) return false
-        if (rxBytes.get() > 0L) {
-            return (nowMs - lastRxMs.get()) < 30_000L
+        if (ewmaWriteUs.get() > 250_000L) return false
+        // SoftEther servers commonly deliver all downlink RX on channel 0 while secondary channels carry TX.
+        // Only check RX freshness on channels that actually received downlink traffic (or primary channel).
+        if (isPrimary && rxBytes.get() > 0L) {
+            return (nowMs - lastRxMs.get()) < 35_000L
         }
-        return (nowMs - connectedAtMs) < 18_000L
+        return true
     }
 
     suspend fun connectAndHandshake(

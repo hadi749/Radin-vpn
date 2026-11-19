@@ -150,13 +150,21 @@ class MainViewModel @Inject constructor(
         return currentSettings.vpnProtocolProfiles[profileKey]
     }
 
-    fun connectSelectedServer() {
+    private fun shouldStartWithWarp(selectedCustomServer: Boolean): Boolean {
         val proto = settings.value.vpnProtocol
-        if (proto == VpnProtocol.WARP || resolveLearnedProtocolForCurrentNetwork() == VpnProtocol.WARP.name) {
+        if (proto == VpnProtocol.WARP) return true
+        if (proto != VpnProtocol.AUTO_SMART || selectedCustomServer) return false
+        val learned = resolveLearnedProtocolForCurrentNetwork()
+        return learned == null || learned == VpnProtocol.WARP.name
+    }
+
+    fun connectSelectedServer() {
+        val currentSelection = _selectedServer.value
+        if (shouldStartWithWarp(selectedCustomServer = currentSelection?.isCustom == true)) {
             connectWarp()
             return
         }
-        var server = _selectedServer.value
+        var server = currentSelection
         val now = System.currentTimeMillis()
         val hasLowLatencyHealthy = servers.value.any { ServerRepository.isLowLatencyRegion(it.countryShort) && it.cooldownUntil <= now }
         if (server == null ||
@@ -195,15 +203,14 @@ class MainViewModel @Inject constructor(
         val warpIntent = WarpService.buildConnectIntent(context)
         try {
             ContextCompat.startForegroundService(context, warpIntent)
-            addLog("Starting Cloudflare WARP with clean IP scanner...")
+            addLog("Starting Cloudflare WARP with anti-DPI NoiseProxy & UDP endpoint race...")
         } catch (e: Exception) {
             addLog("Failed to start WARP service: ${e.message}")
         }
     }
 
     fun quickConnect() {
-        val proto = settings.value.vpnProtocol
-        if (proto == VpnProtocol.WARP || resolveLearnedProtocolForCurrentNetwork() == VpnProtocol.WARP.name) {
+        if (shouldStartWithWarp(selectedCustomServer = false)) {
             connectWarp()
             return
         }

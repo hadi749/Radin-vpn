@@ -196,8 +196,9 @@ object CensorshipDetector {
             if (includeDirectProbe && !isCellular) {
                 add(SniStrategy.DISABLED)
             }
-            add(SniStrategy.ZAPRET_SPLIT1_DESYNC)
             add(SniStrategy.ADAPTIVE_HYBRID_DESYNC)
+            add(SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT)
+            add(SniStrategy.ZAPRET_SPLIT1_DESYNC)
             add(SniStrategy.TLS_HEADER_DESYNC)
             add(SniStrategy.MULTI_CHUNK_FRAGMENTATION)
             if (!isCellular) {
@@ -367,7 +368,10 @@ object CensorshipDetector {
         ) {
             return FilterClassification.DEEP_CLIENTHELLO_DPI
         }
-        if (SniStrategy.DECOY_SNI_FRAGMENT in passing || SniStrategy.CUSTOM_SNI in passing) {
+        if (SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT in passing ||
+            SniStrategy.DECOY_SNI_FRAGMENT in passing ||
+            SniStrategy.CUSTOM_SNI in passing
+        ) {
             return FilterClassification.SNI_ALLOWLIST_FILTER
         }
         return FilterClassification.UNKNOWN

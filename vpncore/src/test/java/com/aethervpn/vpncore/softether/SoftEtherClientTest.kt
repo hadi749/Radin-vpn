@@ -119,4 +119,20 @@ class SoftEtherClientTest {
         )
         assertEquals(1, chosen)
     }
+
+    @Test
+    fun testSecondaryTxOnlyChannelStaysHealthyUntilWriteStalls() {
+        val now = System.currentTimeMillis()
+        val secondary = SoftEtherChannel(1, "h", "1.2.3.4", 443, false, SniStrategy.AUTO_SMART, null, false, null)
+        secondary.isConnected.set(true)
+        secondary.lastRxMs.set(0L)
+        secondary.rxBytes.set(0L)
+        secondary.ewmaWriteUs.set(12_000L)
+
+        assertTrue("Connected TX-only secondary channel should remain healthy", secondary.isHealthy(now))
+
+        secondary.ewmaWriteUs.set(400_000L)
+        assertFalse("Severely stalled secondary channel should be marked unhealthy", secondary.isHealthy(now))
+    }
 }
+

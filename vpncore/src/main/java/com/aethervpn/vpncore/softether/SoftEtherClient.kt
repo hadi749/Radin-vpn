@@ -217,7 +217,7 @@ class SoftEtherClient(
                 primaryChannel.readLoop { buffer, offset, length -> handleIncomingEthernetFrame(buffer, offset, length) }
             }
 
-            // 2. Establish Secondary Channels (Multi-TCP bonding) in Parallel
+            // 2. Establish Secondary Channels (Multi-TCP bonding) asynchronously so DHCP & TUN start immediately
             val effectiveTarget = minOf(config.targetConnections, sessionInfo.maxConnections)
                 .coerceIn(1, SoftEtherConstants.MAX_SUPPORTED_CONNECTIONS)
 
@@ -227,43 +227,43 @@ class SoftEtherClient(
                     "Multiplexing tunnel over $effectiveTarget parallel TCP connections..."
                 )
 
-                coroutineScope {
-                    (1 until effectiveTarget).map { id ->
-                        async(Dispatchers.IO) {
-                            if (!scope.isActive || !isRunning.get()) return@async
-                            try {
-                                val ch = SoftEtherChannel(
-                                    channelId = id,
-                                    host = config.host,
-                                    ipAddress = config.ipAddress,
-                                    port = config.port,
-                                    isPrimary = false,
-                                    sniStrategy = config.sniStrategy,
-                                    customSni = config.customSni,
-                                    strictCert = config.strictCert,
-                                    socketProtector = socketProtector,
-                                    connectTimeoutMs = config.connectTimeoutMs,
-                                    decoySeed = decoySeedSeq.getAndIncrement()
-                                )
-                                ch.connectAndHandshake(
-                                    username = config.username,
-                                    password = config.password,
-                                    hubName = config.hubName,
-                                    targetConnections = effectiveTarget,
-                                    existingSessionKey = sessionKey
-                                )
-                                channels.add(ch)
-                                ch.startWriter(scope)
-                                updateActiveChannels()
-
-                                scope.launch(Dispatchers.IO) {
-                                    ch.readLoop { buffer, offset, length -> handleIncomingEthernetFrame(buffer, offset, length) }
-                                }
-                            } catch (_: Exception) {
-                                // If an additional channel fails, continue with established channels
+                for (id in 1 until effectiveTarget) {
+                    scope.launch(Dispatchers.IO) {
+                        if (!isRunning.get()) return@launch
+                        try {
+                            val ch = SoftEtherChannel(
+                                channelId = id,
+                                host = config.host,
+                                ipAddress = config.ipAddress,
+                                port = config.port,
+                                isPrimary = false,
+                                sniStrategy = config.sniStrategy,
+                                customSni = config.customSni,
+                                strictCert = config.strictCert,
+                                socketProtector = socketProtector,
+                                connectTimeoutMs = config.connectTimeoutMs,
+                                decoySeed = decoySeedSeq.getAndIncrement()
+                            )
+                            ch.connectAndHandshake(
+                                username = config.username,
+                                password = config.password,
+                                hubName = config.hubName,
+                                targetConnections = effectiveTarget,
+                                existingSessionKey = sessionKey
+                            )
+                            if (!isRunning.get()) {
+                                ch.close()
+                                return@launch
                             }
+                            channels.add(ch)
+                            ch.startWriter(scope)
+                            updateActiveChannels()
+                            listener.onLog("SoftEther secondary TCP channel #$id joined (${activeChannelsArray.size}/$effectiveTarget active)")
+                            ch.readLoop { buffer, offset, length -> handleIncomingEthernetFrame(buffer, offset, length) }
+                        } catch (_: Exception) {
+                            // If an additional channel fails, supervision loop will retry cleanly
                         }
-                    }.awaitAll()
+                    }
                 }
             }
 
@@ -611,12 +611,12 @@ class SoftEtherClient(
     private fun cleanupDeadChannels(nowMs: Long = System.currentTimeMillis()) {
         val staleOrDead = channels.filter { ch ->
             !ch.isConnected.get() ||
-                (!ch.isPrimary && ch.txBytes.get() > 8192L && (nowMs - ch.lastRxMs.get()) > 25_000L && channels.size > 1)
+                (!ch.isPrimary && ch.ewmaWriteUs.get() > 350_000L && channels.size > 1)
         }
         if (staleOrDead.isNotEmpty()) {
             for (ch in staleOrDead) {
                 if (ch.isConnected.get()) {
-                    listener.onLog("Recycling stalled secondary TCP channel ${ch.channelId}")
+                    listener.onLog("Recycling severely stalled secondary TCP channel ${ch.channelId}")
                 }
                 ch.close()
                 channels.remove(ch)

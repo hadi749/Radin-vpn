@@ -223,5 +223,30 @@ class CensorshipDetectorTest {
             .toSet()
         assertEquals(SniStrategy.DEFAULT_DECOY_SNIS.toSet(), picked)
     }
+
+    @Test
+    fun detectsSniAllowlistFilterWithIranAllowlistSniFragment() = runBlocking {
+        val executor = FakeProbeExecutor(
+            tcpReachable = true,
+            passingStrategies = setOf(SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT)
+        )
+        val diagnosis = CensorshipDetector.detectBestStrategy(
+            host = "allowlist-dpi.opengw.net",
+            ipAddress = InetAddress.getByName("203.0.113.14"),
+            port = 443,
+            networkProfile = "CELLULAR_IRANCELL",
+            stopOnFirstWinner = true,
+            executor = executor
+        )
+
+        assertEquals(FilterClassification.SNI_ALLOWLIST_FILTER, diagnosis.classification)
+        assertEquals(SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT, diagnosis.recommendedStrategy)
+
+        val pickedWhitelist = (0 until SniStrategy.IRAN_WHITELIST_SNIS.size)
+            .map { SniStrategy.pickIranWhitelistSni(it) }
+            .toSet()
+        assertEquals(SniStrategy.IRAN_WHITELIST_SNIS.toSet(), pickedWhitelist)
+    }
 }
+
 

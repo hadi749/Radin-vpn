@@ -379,6 +379,7 @@ class ServerRepository @Inject constructor(
         }
         val probeStrategies = listOf(
             SniStrategy.ADAPTIVE_HYBRID_DESYNC to 1,
+            SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT to 1,
             SniStrategy.ZAPRET_SPLIT1_DESYNC to 1,
             SniStrategy.TLS_HEADER_DESYNC to 2,
             SniStrategy.MULTI_CHUNK_FRAGMENTATION to 16,
@@ -839,6 +840,7 @@ class ServerRepository @Inject constructor(
 
         internal val DEFAULT_MIRROR_BYPASS_CANDIDATES = listOf(
             MirrorBypassCandidate("ADAPTIVE_HYBRID_DESYNC:1", SniStrategy.ADAPTIVE_HYBRID_DESYNC, 1),
+            MirrorBypassCandidate("IRAN_ALLOWLIST_SNI_FRAGMENT:1", SniStrategy.IRAN_ALLOWLIST_SNI_FRAGMENT, 1),
             MirrorBypassCandidate("ZAPRET_SPLIT1_DESYNC:1", SniStrategy.ZAPRET_SPLIT1_DESYNC, 1),
             MirrorBypassCandidate("TLS_HEADER_DESYNC:2", SniStrategy.TLS_HEADER_DESYNC, 2),
             MirrorBypassCandidate("MULTI_CHUNK_FRAGMENTATION:16", SniStrategy.MULTI_CHUNK_FRAGMENTATION, 16),

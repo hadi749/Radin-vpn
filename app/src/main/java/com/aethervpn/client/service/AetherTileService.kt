@@ -63,7 +63,10 @@ class AetherTileService : TileService() {
                 } else {
                     null
                 }
-                if (settings.vpnProtocol == VpnProtocol.WARP || learnedProto == VpnProtocol.WARP.name) {
+                val startWarp = settings.vpnProtocol == VpnProtocol.WARP ||
+                    (settings.vpnProtocol == VpnProtocol.AUTO_SMART &&
+                        (learnedProto == null || learnedProto == VpnProtocol.WARP.name))
+                if (startWarp) {
                     ContextCompat.startForegroundService(
                         applicationContext,
                         WarpService.buildConnectIntent(applicationContext)
